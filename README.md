@@ -6,6 +6,6 @@ To ensure full reproducibility, code releases and dataset files are permanently 
 
 * **Codebase Archive (v1.0.0):** [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21448912.svg)](https://doi.org/10.5281/zenodo.21448912)
 * **Genotype Dataset:** [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21448918.svg)](https://doi.org/10.5281/zenodo.21448918)
-  * Includes **5,688K genotype panel data** for **27 ancient cattle samples**:
-    * **Capture data:** $n = 27$
-    * **Shotgun data:** $n = 13$
+  * Includes **5688K genotype panel data** for **27 ancient cattle samples**:
+    * **Capture data:** n = 27
+    * **Shotgun data:** n = 13
