@@ -1,0 +1,73 @@
+#######################################
+### 1. ANGSD X cont - DairyCultures ###
+##########################################
+
+cd /home/projects1/DairyCultures/analysis/
+mkdir -p Bos_Xcont_260327; cd Bos_Xcont_260327
+
+pt1=($(pwd)"/")
+info="/home/projects1/DairyCultures/sample_info/Bos_ancient_sample_info_250916.txt"
+lst1=${pt1}"DairyCultures_male_bamlist_260327.txt"
+scf1=${pt1}"ANGSD_Xcont_260327.sh"
+
+# make male bam list 
+rm -f ${lst1}
+while read iid rid sp dt1; do 
+    ibam=($(realpath ${dt1}${iid}/BAM/${rid}.${sp}/${rid}.${sp}.*.rmdup.q30.bam ))
+    echo -e ${iid}"\t"${rid}"\t"${sp}"\t"${dt1}"\t"${ibam} >> ${lst1}
+done < <(grep "DairyCulture" ${info} | awk -F"\t" '{if ($18=="M") print $1,$2,$3,$4}' )
+
+## Run the job as a job array
+idnmax=($(wc -l ${lst1}))
+nperrun=8
+
+CMD=${scf1}" "${lst1}
+
+sbatch --array=1-${idnmax}%${nperrun} -c 8 --mem 15000 -J Xcont --wrap="$CMD"
+
+## summarize 
+of2=${pt1}"DairyCultures.angsdXcont.260327.txt"
+
+echo -e "IID\tRID\tnSNP\tnFlank\trSNP\trFlank\tMethod\tMoM\tSE(MoM)\tML\tSE(ML)" > ${of2}
+
+sfx="5688K.all"
+while read iid rid sp dt1 ibam; do 
+    rn1=${dt1}${iid}"/Xcontam/"${rid}"."${sp}"/"${rid}"."${sp}"."${sfx}".angsd.Xcont"
+    n1=($(grep "nSNP sites" ${rn1}| cut -d ":" -f2| cut -d "," -f1|sed s/" "/""/g))
+    n2=($(grep "with flanking" ${rn1}| cut -d ":" -f3| sed s/" "/""/g))
+    n3=($(grep "MisMatch_rate_for_snpsite" ${rn1}| cut -d ":" -f3))
+    n4=($(grep "Mismatch_rate_for_flanking" ${rn1}| cut -d ":" -f2| cut -d " " -f1))
+    n5="Method1"
+    n6=($(grep ${n5} ${rn1}|grep "new_llh"|cut -d " " -f4| cut -d ":" -f2))
+    n7=($(grep ${n5} ${rn1}|grep "new_llh"|cut -d " " -f5| cut -d ":" -f2))
+    n8=($(grep ${n5} ${rn1}|grep "new_llh"|cut -d " " -f6| cut -d ":" -f2))
+    n9=($(grep ${n5} ${rn1}|grep "new_llh"|cut -d " " -f7| cut -d ":" -f2))
+    echo ${iid} ${rid} ${n1} ${n2} ${n3} ${n4} ${n5} ${n6} ${n7} ${n8} ${n9}|sed s/" "/"\t"/g >> ${of2}
+    echo ${iid} ${rid} ${n1} ${n2} ${n3} ${n4} ${n5} ${n6} ${n7} ${n8} ${n9}
+done < ${lst1}
+
+
+###############################################################
+#### write the following script as "ANGSD_Xcont_260327.sh" ####
+
+#!/bin/bash
+
+lst1=$1
+
+inum=$SLURM_ARRAY_TASK_ID
+
+iid=($(awk -v inum=$inum '{if (NR==inum) print $1}' ${lst1}))
+rid=($(awk -v inum=$inum '{if (NR==inum) print $2}' ${lst1}))
+sp=($(awk -v inum=$inum '{if (NR==inum) print $3}' ${lst1}))
+dt1=($(awk -v inum=$inum '{if (NR==inum) print $4}' ${lst1}))
+ibam=($(awk -v inum=$inum '{if (NR==inum) print $5}' ${lst1}))
+
+fn1="/data2/projects1/AnimalsChina/analysis/Bos/Xcontam_231225/position/Bos.5688K.X.trunc.all.angsd.frq" # frequency file 
+sfx="5688K.all" # suffix 
+
+mkdir -p ${dt1}${iid}/Xcontam/${rid}.${sp}; cd ${dt1}${iid}/Xcontam/${rid}.${sp}
+
+angsd -i ${ibam} -r X:5000000-132000000 -doCounts 1  -iCounts 1 -minMapQ 30 -minQ 30 -out ${rid}.${sp}.${sfx}.angsdCounts
+
+contamination -a ${rid}.${sp}.${sfx}.angsdCounts.icnts.gz -h ${fn1}.gz -b 5000000 -c 132000000 2> ${rid}.${sp}.${sfx}.angsd.Xcont
+

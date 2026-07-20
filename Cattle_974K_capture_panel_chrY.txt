@@ -1,0 +1,708 @@
+########################################
+### To produce Bos 974K SNP panel, extract SNPs of Y chromosome which can distinguish subtrees
+### Use 259 male Cattle file
+###########################################
+## 1. filter vcf file and make a fasta file ##
+###########################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+mkdir -p chrY; cd chrY
+
+pt1=($(pwd)"/")
+reff="/home/References/Cattle/ARS-UCD1.2.chrY.fa"
+ref2=${pt1}"Bos.Reference.chrY.fa"
+fn1="/data1/PubData/CattleMerged_210420/VCF_filtering/Bos.biSNP.q30.Y.vcf.gz" ## 72769 variants
+of1=${pt1}"Bos.chrY"
+
+## extract Reference Y chromosome only
+samtools faidx ${reff} Y > ${ref2}
+samtools faidx ${ref2}
+
+picardcmd="java -Xmx2048m -jar /opt/ohpc/pub/apps/picardtools/2.27.1/picard.jar "
+picardcmd+="CreateSequenceDictionary"
+${picardcmd} REFERENCE=Bos.Reference.chrY.fa OUTPUT=Bos.Reference.chrY.dict
+
+
+## extract sample ID
+tr  '\t' '\n' < <(bcftools view -h ${fn1} |tail -n 1) |tail -n +10 > temp1
+
+while read iid; do
+awk -v iid=$iid '{ if ($1==iid) print $2 }' /data1/PubData/CattleMerged_210420/CombineGVCF595/New_sample_names.txt >> New_ID.txt
+done < temp1
+
+rm temp1
+
+## change sample name
+bcftools reheader -s New_ID.txt ${fn1} -o ${of1}.vcf.gz
+rm New_ID.txt
+
+## extract depth data
+/usr/local/bin/vcftools --gzvcf ${of1}.vcf.gz --geno-depth --out ${of1}
+
+#######################################################################
+## R script to make a snp list & individual list with high missing % ##
+#######################################################################
+
+R
+setwd(getwd())
+
+## depth data by vcftools
+d1 = read.table(file="Bos.chrY.gdepth", header = T)
+
+## assign missing to individual whose dp < 3
+## extract the missing ratio where the DP value is less than 3
+for(i in 1:nrow(d1)){
+    d1$miss[i]= 1 - length(which(d1[i,3:ncol(d1)]>=3))/(ncol(d1)-2)
+}
+
+
+## filter out SNPs whose missingness >= 0.25
+nrow(subset(d1, miss >= 0.25)) ## 14,518 SNPs
+msnp = subset(d1[c(1,2)], d1[c(1,2,ncol(d1))]$miss>=0.25)
+fd1 <- subset(d1,miss <0.25) ## filtered data
+
+## filter out Inds whose missingness >= 0.25 after filtering
+ntot=nrow(fd1)
+nind=ncol(fd1)-1
+ind = head(fd1[c(3:nind)],n=1) # individual
+for(i in 3:nind) {
+    j=i-2
+    ind[1,j]=length(which(fd1[,i] <3))/ntot
+}
+
+ind <- t(ind)
+nrow(subset(ind,ind[,1] >= 0.5)) ## 4 individual
+mind <- data.frame(rownames(subset(ind,ind[,1] >= 0.5)))
+
+## save a snp list & individual list with high missing %
+write.table(msnp, file="msnp.txt", quote=FALSE, row.names = F, col.names = F, sep="\t", append= F)
+write.table(mind, file="mind.txt", quote=FALSE, row.names = F, col.names = F, append= F)
+
+## End R script
+
+##############################################################
+#### 2. Build ML tree based on filtered Y chromosome data ####
+##############################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/chrY/
+
+pt1=($(pwd)"/")
+of1=${pt1}"Bos.chrY"
+
+scf1=${pt1}"make_fasta.sh"
+scf2=${pt1}"extract_subtree.py"
+
+## extract filtered vcf file
+vcftools --remove "mind.txt" --exclude-positions "msnp.txt" --gzvcf ${of1}.vcf.gz --recode --out ${of1}.filtered
+mv ${of1}.filtered.recode.vcf ${of1}.filtered.vcf
+gzip ${of1}.filtered.vcf 
+
+## make fasta file 
+sbatch -c 12 --mem 22000 --wrap=${scf1}" "${of1}
+
+## tail -n +2 ${of1}.fasta > temp; mv temp ${of1}.fasta
+## or use vim to remove head first line
+## run iqtree
+
+CMD="iqtree -s ${of1}.fasta -pre Bos.chrY -m HKY"
+sbatch -c 12 --mem 22000 --wrap="$CMD"
+
+## change unrooted tree to rooted tree by Figtree
+## remove branch information 
+## extract subtree
+tr1=${of1}".rooted"
+tr2=${of1}".rooted.nonum"
+
+sed 's/:[0-9].[0-9]*//g' ${tr1}.treefile| sed 's/E-[0-9]//g' |sed 's/;//g'> ${tr2}.treefile
+
+sbatch -c 16 --mem 30000 -J genotyping --wrap="${scf2} ${tr2}.treefile ${of1}.subtree.txt"
+
+nt=($(wc -l ${of1}.subtree_list.txt))
+let nt-=1
+head -n ${nt} ${of1}.subtree_list.txt > temp 
+mv temp ${of1}.subtree_list.txt
+
+##### save the following script as "make_fasta.sh" ##########
+#!/bin/bash
+
+of1=$1
+of2=${of1}".fasta"
+while read sample; do
+    /usr/local/bin/vcftools --indv $sample --gzvcf ${of1}.vcf.gz --recode --out $sample  ## split into individual vcf file
+    echo -e "\n>"$sample >> ${of2}
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n' $sample.recode.vcf | awk 'OFS="\t"{if ($5==0) printf $3; else if ($5==1) printf $4; else if ($5==".") printf "?"}' >> ${of2}
+
+    rm $sample.log
+    rm $sample.recode.vcf
+done < <(bcftools query -l ${of1}.vcf.gz)
+
+tail -n +2 ${of2} > temp1
+mv temp1 ${of2}
+
+############################################################
+## save the following script as "extract_subtree.py" ##
+############################################################
+## written by donghee kim 220728
+## This script extracts subtree from rooted tree without ";" in the end
+
+#!/opt/ohpc/pub/anaconda3/bin/python3.9
+
+import pandas as pd
+from pandas import Series, DataFrame
+import sys
+
+INPUT = sys.argv[1] ## newick format rooted tree
+OUTPUT= sys.argv[2] ## subtree list and index
+
+s= open(INPUT, 'r')
+
+root_tree=[("R",s)]
+subtree=pd.DataFrame(root_tree,columns=['Name','tree'])
+
+num=0
+while len(subtree) > num:
+    tree=subtree.iloc[num,1]
+    name=subtree.iloc[num,0]
+    lentr=len(tree)
+    
+    lth=0 ## count "("  
+    rth=0 ## count ")"
+    point=0
+    for j in range(1,lentr):
+        if tree[j]=="(" :
+            lth+=1
+        elif tree[j]==")" :
+            rth+=1
+        elif rth == lth and tree[j]==",": ## this is the point when rooted tree is divided into two subtrees
+            point=j
+            break
+    
+    ltr_name=name+"A"
+    ltr_tree=tree[1:point]
+    if len(ltr_tree) > 5:
+        subtree.loc[len(subtree)] = [ltr_name,ltr_tree]
+    rtr_name=name+"B"
+    rtr_tree=tree[point+1:lentr-1]
+    if len(rtr_tree) > 5:
+        subtree.loc[len(subtree)] = [rtr_name,rtr_tree]
+    
+    num+=1
+
+subtree.to_csv(OUTPUT,sep="\t",index=False)
+
+##################################################################
+########### 3. extract snp tagging branch on the MLtree ##########
+##################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/chrY/
+
+pt1=($(pwd)"/")
+
+scf1=${pt1}"VCF_genotype_filtering_chrY.py"
+scf2=${pt1}"extract_snps_tagging.sh"
+fn1=${pt1}"Bos.chrY"
+of1=${pt1}"Bos.chrY"
+tr1=${fn1}".subtree_list.txt"
+str1=${fn1}".tree_in.txt"
+gpc="0.9"
+
+## genotyping
+sbatch -c 16 --mem 30000 -J genotyping --wrap="${scf1} ${fn1}.filtered.vcf.gz ${gpc} ${fn1}.geno"
+
+## make snp file 
+zcat ${fn1}.filtered.vcf.gz |awk '{OFS="\t"} { if ($1 !~ /#/) print $1":"$2,$1,"0.0",$2,$4,$5 }' > ${fn1}.snp
+
+## make ind file, 255 inds
+ind="/home/projects1/AnimalsHapSharing/595_DATA/Master.WGS.ind"
+
+tr  '\t' '\n' < <(bcftools view -h ${fn1}.filtered.vcf.gz |tail -n 1) |tail -n +10 > temp
+
+while read iid; do
+awk -v iid=$iid '{ if ( $1 == iid ) print $0 }' ${ind} >> ${fn1}.ind
+done < temp1
+
+rm temp1
+
+## Extract snp with allele frequency value of 1,0 or 0,1 inside and outside the subtree
+## list of individual within subtree
+## $1=ind, $2=subtree
+rm ${str1} ## make sure not overwriting
+while read name tree; do
+    for ind in $(awk '{print $1}' ${fn1}.ind); do
+        if grep -q $ind <<< $tree; then
+            echo -e  "${ind}\t${name}" >> ${str1}
+        fi
+    done
+done < <(tail -n +3 ${tr1})
+
+fth=0 ## frequency threshold
+mth=0.5 ## missingness threshold
+
+sbatch -c 16 --mem 30000 --wrap=${scf2}" "${tr1}" "${of1}" "${fth}" "${mth}
+
+## ingroup
+tr2=${of1}".Ingroup.subtree_list.txt"
+of2=${of1}".Ingroup"
+str2=${of2}".tree_in.txt"
+
+echo -e "Name\ttree" > ${tr2}
+awk '{ if ($1 ~/RA/) print $0}' ${tr1} >> ${tr2}
+
+rm ${str2} ## make sure not overwriting
+while read name tree; do
+    for ind in $(awk '{print $1}' ${of2}.ind); do
+        if grep -q $ind <<< $tree; then
+            echo -e  "${ind}\t${name}" >> ${str2}
+        fi
+    done
+done < <(tail -n +3 ${tr2})
+
+fth=0 ## frequency threshold
+mth=0.5 ## missingness threshold
+
+sbatch -c 16 --mem 30000 --wrap=${scf2}" "${tr2}" "${of2}" "${fth}" "${mth}
+
+## combine snps from Ingroup (repeatitive mutation in outgroup) and total group
+## 343 SNPS newly captured
+cat Bos.chrY.freq0.miss0.5.uniq.txt Bos.chrY.Ingroup.freq0.miss0.5.uniq.txt |sort -u -k1n > ${of1}.combined.uniq.txt
+
+## count the number of snps per subtree
+rn1=${of1}".combined"
+while read name tree; do
+nsnp=($(awk -v name=$name '{if ($2==name) print name}' ${rn1}.uniq.txt|wc -l ))
+echo -e "${name}\t${nsnp}" >> ${rn1}.numsnp.txt
+done < <(tail -n +3 ${tr1})
+
+## list of subtree whose nsnps > 0
+awk '{ if ($2 >0) print $0}' ${rn1}.numsnp.txt > ${rn1}.numsnp.gt0.txt 
+
+while read snp name geno; do
+awk -v name=$name -v snp=$snp '{ if ($1==name) print snp, name, $2}' ${rn1}.numsnp.gt0.txt >> ${rn1}.snpinfo.txt
+done < <(cut -f 1,2,3 ${rn1}.uniq.txt)
+
+## remove snps within 52 bps 
+## calculate the distance between snps
+## put NA on the first and last SNP
+tail -n +2 ${rn1}.uniq.txt| awk 'NR > 1 { print $1 - prev } { prev = $1 }' > temp_right.txt
+echo "NA" > temp_left.txt
+cat temp_right.txt >> temp_left.txt
+echo "NA" >> temp_right.txt
+
+## cbind distance data between SNPs
+## $3: SNPs of tree
+## $4: Distance to the nearest left SNP 
+## $5: Distance to the nearest right SNP 
+cat ${rn1}.snpinfo.txt |paste - temp_left.txt temp_right.txt  > temp2.txt
+
+## remove snps within 52bp, whose subtree have more snps
+awk '{if ( ($4>52) || ($3<prev) ) print $0} { prev = $3 }' temp2.txt > temp3.txt 
+ 
+sort -k1nr temp3.txt | awk '{if ( ($5>52) || ($3<prev) ) print $0} { prev = $3 }' |sort -k1n > ${rn1}.52bp.txt
+
+### shuf at most 100 snps per subtree
+while read name tree; do
+grep -w ${name} ${rn1}.52bp.txt |awk '{OFS="\t"}{print $1,$2}' |shuf -n 100 >> ${of1}.shuf.txt ## 2438 SNPs, 91 trees
+done < <(tail -n +3 ${of1}.subtree_list.txt) 
+
+## shuf 62 snps among rest snps left&right >52
+cut -f1 ${of1}.shuf.txt|fgrep -vwf - ${rn1}.52bp.txt | shuf -n 62 |awk '{OFS="\t"}{print $1,$2}' > temp_rest
+
+## finalize 2500 snps
+## snpinfo: $1=SNP, $2=TREENAME, $3=GENO, $4=TREE
+cat temp_rest ${of1}.shuf.txt | cut -f1| fgrep -wf - ${of1}.snp > ${of1}.2500.snp
+
+head -n 1 Bos.chrY.combined.uniq.txt > ${of1}.2500.snpinfo.txt
+awk '{print $4}' ${of1}.2500.snp|fgrep -wf - Bos.chrY.combined.uniq.txt > temp_wrb  
+
+trb=($(grep -w "RB" ${tr1}|cut -f2))
+awk -v trb=$trb '{OFS="\t"}{ if ($2=="RA") print $1,"RB",0,trb}'  temp_wrb  > temp_rb
+cat temp_wrb temp_rb|sort -k1n >> ${of1}.2500.snpinfo.txt 
+
+echo -e "NAME\tnSNP" > ${of1}.2500.treeinfo.txt
+while read name tree; do
+nsnp=($(awk -v name=$name '{if ($2==name) print name}' ${of1}.2500.snpinfo.txt |wc -l ))
+echo -e "${name}\t${nsnp}" >> ${of1}.2500.treeinfo.txt
+done < <(tail -n +3 ${tr1})
+
+mkdir -p INFO
+cp Bos.chrY.2500* ./INFO/
+cp Bos.chrY.subtree_list.txt ./INFO/
+
+
+rm temp*; rm slurm*
+
+
+############## save the following script as "extract_snps_tagging.sh" ###################
+
+## calculate allele frequency inside subtree
+## freq filter & missingness filter 
+## freq threshold : freq(in) <= fre_th && freq(out) >= 1-fre_th || freq(out) <= fre_th && freq(in) >= 1-fre_th
+## missingness threshold : miss(in) <= miss_th && miss(out) <= miss_th
+
+#!/bin/bash
+
+tr1=$1
+of1=$2
+fth=$3 ## frequency threshold
+mth=$4 ## missingness threshold
+
+rn1=${of1}".freq"${fth}".miss"${mth}
+tr2=${of1}".tree_in.txt"
+
+
+echo -e "SNP\tTREENAME\tGENO\tTREE" > ${rn1}.txt
+
+while read name tree; do
+    cn0s="" ## treein
+    while read cn; do
+    if [[ "$cn0s" == "" ]]; then cn0s+=${cn}; else cn0s+=","${cn}; fi
+    done < <(awk -v name=${name} '{if ( $2==name) print $1}' ${tr2}|fgrep -n -f - ${of1}.ind|cut -d ":" -f1 )
+    
+    cn1s="" ## treeout
+    while read cn; do
+    if [[ "$cn1s" == "" ]]; then cn1s+=${cn}; else cn1s+=","${cn}; fi
+    done < <(awk -v name=${name} '{if ($2==name) print $1}' ${tr2}|fgrep -n -vf - ${of1}.ind|cut -d ":" -f1 )
+    
+    cut -b${cn0s} ${of1}.geno > treein.geno
+    cut -b${cn1s} ${of1}.geno > treeout.geno
+    
+    nin=($(head -n 1 treein.geno| awk '{print length($0)}'))
+    awk -F9 '{print NF-1}' treein.geno > temp_11
+    awk -F0 '{print NF-1}' treein.geno > temp_12
+    paste temp_11 temp_12 |\
+    awk -v nin="$nin" '{OFS="\t"} {if ($1 == nin) print $1/nin,0; else print $1/nin,$2/(nin-$1) }'  > treein.stat.txt # miss freq, alt allele freq
+
+    nout=($(head -n 1 treeout.geno| awk '{print length($0)}'))
+    awk -F9 '{print NF-1}' treeout.geno > temp_21
+    awk -F0 '{print NF-1}' treeout.geno > temp_22
+    paste temp_21 temp_22 |\
+    awk -v nout="$nout" '{OFS="\t"} {if ($1 == nout) print $1/nout,0; else print $1/nout,$2/(nout-$1) }'  > treeout.stat.txt # miss freq, alt allele freq
+    
+    ## allele freq & missingness filter
+    paste ${of1}.snp treein.stat.txt treeout.stat.txt | awk -v name=$name -v tree=$tree -v fth=$fth -v mth=$mth '{OFS="\t"} {if (  (($8 <= fth && $10 >= 1-fth) || ($8 >= 1-fth && $10 <= fth)) && ($7 <= mth && $9 <= mth) )  \
+    print $1,name, 2*(1-$8), tree}' >> ${rn1}.txt ## $1=snp, $2=tree, $3=mutation status (ref=2,alt=0)
+    rm treein.*; rm treeout.*;rm temp*
+done < <(tail -n +3 ${tr1})
+
+## no missing & specific
+## there can be duplicate snps because of missingness
+## we assign SNPs on the higher subtree
+sed 's/Y://g' ${rn1}.txt |sort -u -k1n > ${rn1}.uniq.txt  
+
+## count the number of snps per subtree
+while read name tree; do
+nsnp=($(awk -v name=$name '{if ($2==name) print name}' ${rn1}.uniq.txt|wc -l ))
+echo -e "${name}\t${nsnp}" >> ${rn1}.numsnp.txt
+done < <(tail -n +3 ${tr1})
+
+## list of subtree whose nsnps > 0
+awk '{ if ($2 >0) print $0}' ${rn1}.numsnp.txt > ${rn1}.numsnp.gt0.txt 
+
+
+
+
+
+
+###### save the following script as "VCF_genotype_filtering_chrY.py" ##############
+
+#!/opt/ohpc/pub/anaconda3/bin/python3.9
+
+## This code is writtne for genotyping and filtering the VCF file from PL(phred scaled genotype likelihood)
+## Rewritten by Haechan in 220530 (reused VCF_genotype_filtering.py)
+## Extract genotype of haploid
+
+# Import modules
+import sys
+import pandas as pd
+import gzip
+import time
+
+
+# INPUT
+INPUT = sys.argv[1]
+GL_CUTOFF = float(sys.argv[2])
+OUTPUT= sys.argv[3]
+
+# Global variables
+
+GENOTYPE = [2,0,9] # count reference allele
+# main
+
+def main():
+    start_time = time.time()
+    outfile = open(OUTPUT, 'w')
+    print('Trying to open file')
+    gzip_file = gzip.open(INPUT, 'r')
+    print('Open file')
+    i = 0
+    print('start parsing')
+    while True:
+        line = gzip_file.readline()
+        if not line:
+            break
+        line = line.decode()
+        if line[0:2] == "##":
+            continue
+        elif line[0] == "#":
+            VCF_header=line.replace('#', '').replace('\n', '').split('\t')
+            Individual = VCF_header[9:]
+        else:
+            variant_data = line.replace('\n', '').split('\t')
+            formatNum = len(variant_data[VCF_header.index('FORMAT')].split(':'))  # e.g. GT:AD:DP....
+            PL_index = variant_data[VCF_header.index('FORMAT')].split(':').index('PL')
+            geno = ''
+            for ind in Individual:
+                geno_field = variant_data[VCF_header.index(ind)].split(':')
+                if len(geno_field) != formatNum or geno_field[PL_index] == ".":
+                    geno += str(9)
+                else:
+                    GL_list = Cal_GL(geno_field[PL_index])
+                    GL_val = [i for i, GL in enumerate(GL_list) if GL >= GL_CUTOFF]
+                    GL_val.append(2)  # if there is no GL larger than GL_CUTOFF then we have to impute genotype as missing
+                    geno += str(GENOTYPE[GL_val[0]])
+            print(geno, file=outfile)
+            i += 1
+            if i % 10000 == 0:
+                print(f"{i}th SNP processed")
+    outfile.close()
+    end_time = time.time()
+    take_time = round((end_time-start_time)/60,2)
+    print(f"It takes {take_time} min")
+
+    return None
+
+def Cal_GL(PL):
+    GL_list = []
+    for prob in PL.split(','):
+        GL_list.append(10**-(0.1*int(prob)))
+    return [GL/sum(GL_list) for GL in GL_list]  # normalize
+
+
+main()
+
+
+
+##############################################################
+#### 4. extract ML tree including only Ingroup  ####
+##############################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/chrY/
+mkdir -p ingroup; cd ingroup
+
+pt1=($(pwd)"/")
+fn1="/data1/PubData/CattleMerged_210420/genotype/chrY/Bos.chrY"
+of1=${pt1}"Bos.Ingroup.chrY"
+out1="/data1/PubData/CattleMerged_210420/genotype/Outgroup.fam"
+out2=${pt1}"outgrouplist.txt"
+in1=${pt1}"ingrouplist.txt"
+
+scf1=${pt1}"make_fasta.sh"
+
+## exclude outgroup
+awk '{print $2}' ${out1}|fgrep -wf - ${fn1}.ind|awk '{print $1}' > ${out2}
+
+fgrep -vf ${out2} ${fn1}.ind |cut -f1 > ${in1}
+
+## extract filtered vcf file
+vcftools --remove ${out2} --gzvcf ${fn1}.filtered.vcf.gz --recode --out ${of1}
+mv ${of1}.recode.vcf ${of1}.vcf
+gzip ${of1}.vcf 
+
+## make fasta file 
+sbatch -c 12 --mem 22000 --wrap=${scf1}" "${of1}
+
+## run iqtree
+fas=${of1}".fasta"
+CMD="iqtree -s ${fas} -pre Bos.Ingroup.chrY -m HKY"
+sbatch -c 12 --mem 22000 --wrap="$CMD"
+
+## change unrooted tree to rooted tree by Figtree
+tr1=${of1}".rooted.treefile"
+
+../extract_subtree.py ${of1}.
+## extract subtree
+../extract_subtree.py ${of1}.treefile ${of1}.subtree_list.txt
+nt=($(wc -l ${of1}.subtree_list.txt))
+let nt-=1
+head -n ${nt} ${of1}.subtree_list.txt > temp 
+mv temp ${of1}.subtree_list.txt
+
+############################################################
+## save the following script as "extract_subtree.py" ##
+############################################################
+## written by donghee kim 220728
+## This script extracts subtree from rooted tree without ";" in the end
+
+#!/opt/ohpc/pub/anaconda3/bin/python3.9
+
+import pandas as pd
+from pandas import Series, DataFrame
+import sys
+
+INPUT = sys.argv[1] ## newick format rooted tree
+OUTPUT= sys.argv[2] ## subtree list and index
+
+s= open(INPUT, 'r')
+
+root_tree=[("R",s)]
+subtree=pd.DataFrame(root_tree,columns=['Name','tree'])
+
+num=0
+while len(subtree) > num:
+    tree=subtree.iloc[num,1]
+    name=subtree.iloc[num,0]
+    lentr=len(tree)
+    
+    lth=0 ## count "("  
+    rth=0 ## count ")"
+    point=0
+    for j in range(1,lentr):
+        if tree[j]=="(" :
+            lth+=1
+        elif tree[j]==")" :
+            rth+=1
+        elif rth == lth and tree[j]==",": ## this is the point when rooted tree is divided into two subtrees
+            point=j
+            break
+    
+    ltr_name=name+"A"
+    ltr_tree=tree[1:point]
+    if len(ltr_tree) > 5:
+        subtree.loc[len(subtree)] = [ltr_name,ltr_tree]
+    rtr_name=name+"B"
+    rtr_tree=tree[point+1:lentr-1]
+    if len(rtr_tree) > 5:
+        subtree.loc[len(subtree)] = [rtr_name,rtr_tree]
+    
+    num+=1
+
+subtree.to_csv(OUTPUT,sep="\t",index=False)
+
+##################################################################
+########### 5. extract snp tagging branch on the MLtree ##########
+##################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/chrY/ingroup
+
+pt1=($(pwd)"/")
+
+scf1="/data1/PubData/CattleMerged_210420/genotype/chrY/VCF_genotype_filtering_chrY.py"
+scf2="/data1/PubData/CattleMerged_210420/genotype/chrY/extract_snps_tagging.sh"
+dt1="/data1/PubData/CattleMerged_210420/genotype/chrY/Bos.chrY"
+fn1=${pt1}"Bos.Ingroup.chrY"
+tr1=${fn1}".subtree_list.txt"
+tr2=${fn1}".tree_in.txt"
+
+in1=${pt1}"ingrouplist.txt"
+
+
+## copy snpfile 
+cp ${dt1}.snp ${fn1}.snp
+
+## make ind file, 255 inds
+while read iid sex pid; do
+awk -v iid=$iid -v sex=$sex -v pid=$pid '{OFS="\t"}{ if ( $1 == iid ) print iid,sex,pid }' ${in1} >> ${fn1}.ind
+done < ${dt1}.ind
+
+## extract geno_file
+cn0s="" ## ingroup
+while read iid sex pid; do
+cn=($(awk -v iid="$iid" 'BEGIN {cn=""} {if ($1 == iid) cn=NR} END {print cn}' ${dt1}.ind))
+if [[ "$cn0s" == "" ]]; then cn0s+=${cn}; else cn0s+=","${cn}; fi
+done < ${fn1}.ind
+    
+cut -b${cn0s} ${dt1}.geno > ${fn1}.geno
+
+
+## Extract snp with allele frequency value of 1,0 or 0,1 inside and outside the subtree
+## list of individual within subtree
+## $1=ind, $2=subtree
+rm ${tr2} ## make sure not overwriting
+while read tree; do
+    while read ind; do
+        if grep -q $ind <<< $tree; then
+            echo -e  "${ind}\t${tree}" >> ${tr2}
+        fi
+    done < <(awk '{print $1}' ${fn1}.ind)
+done < ${tr1}
+
+fth=0 ## frequency threshold
+mth=0.5 ## missingness threshold
+
+sbatch -c 16 --mem 30000 --wrap=${scf2}" "${tr1}" "${fn1}" "${fth}" "${mth}
+
+rn1=${fn1}".freq"${fth}".miss"${mth}
+
+awk '{ if ($2>70) print $1,70 ; else print $0}' ${rn1}.numsnp.gt0.txt | awk '{sum+=$2}END{print sum}' 
+
+##############################################
+#### 6. combine result from 3 and 5 ##########
+##############################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/chrY/
+
+pt1=($(pwd)"/")
+fn1=${pt1}"Bos.chrY"
+fn2=${pt1}"ingroup/Bos.Ingroup.chrY"
+
+fth=0.01 ## frequency threshold
+mth=0.5 ## missingness threshold
+
+rn1=${fn1}".freq"${fth}".miss"${mth}
+rn2=${fn2}".freq"${fth}".miss"${mth}
+
+fgrep -f ingroup/outgrouplist.txt ${rn2}.numsnp.gt0.txt | awk '{ if ($2>100) print $1,100 ; else print $0}' ${rn2}.numsnp.gt0.txt |awk '{sum+=$2}END{print sum}'
+fgrep -f ingroup/outgrouplist.txt ${rn1}.numsnp.gt0.txt | cat - ${rn2}.numsnp.gt0.txt | awk '{ if ($2>100) print $1,100 ; else print $0}' |awk '{sum+=$2}END{print sum}'  ## 3615 -> 3907
+
+fgrep -f ingroup/outgrouplist.txt ${fn1}.subtree_list.txt > temp_tree_out
+
+of1=${fn1}".pos.list.txt"
+
+while read tree; do
+awk '{if ($2==tree) print $0}' ${rn1}.uniq.txt 
+#|shuf -n 100 >> ${of1}
+done < temp_tree_out
+
+while read tree; do
+grep -w ${tree} ${rn2}.uniq.txt |awk '{print $0}' |shuf -n 100 >> ${of1}
+done < ${fn2}.subtree_list.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+printf '%s' "$VAR" | sed 's/:[0-9].[0-9]*//g'
+
+cat rooted_subtree_nonum.txt |sed 's/E-[0-9]//g'  | sed 's/)//g' | sed 's/(//g'| sed 's/,/ /g'|awk '{print length($0)}'|sort
+
+sed 's/[0-9][0-9]/[0-9][0-9] /g' rooted_subtree_nonum.txt
+cat rooted_subtree_nonum.txt |sed 's/E-[0-9]//g' |fgrep -f ingroup/outgrouplist.txt -
+
+
+
+
+de4  
+
+
+
+
+
+
+
+

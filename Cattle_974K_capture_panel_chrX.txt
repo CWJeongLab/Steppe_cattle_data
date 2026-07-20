@@ -1,0 +1,891 @@
+## Excavate SNP of Bovini for capturing outgroup diversity within bos group 
+## Genotyping based on PL score >= 0.9
+## Transversion only
+## Missingness filtering ( Ingroup < 0.2 && Outgroup < 0.6) 
+## Maf filtering ( Ingroup > 0.05 && Outgroup > 0.15)
+## For SNP panel, X chromosome has to occupy 51.8K among 974K 
+
+##################################################################
+########### 1. Genotyping based on PL score #############################
+##################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+
+pt1=($(pwd)"/")
+
+scf=${pt1}"VCF_genotype_filtering_220721.py"
+fn1="/data1/PubData/CattleMerged_210420/VCF_filtering/Bos.biSNP.q30.X.vcf.gz"
+of1=${pt1}"Bos.PL_0.9.X.geno"
+gpc="0.9"
+
+sbatch -c 16 --mem 30000 -J genotyping --wrap="${scf} ${fn1} ${gpc} ${of1}"
+
+
+############ save the following script as "VCF_genotype_filtering_220721.py" ##############
+
+#!/opt/ohpc/pub/anaconda3/bin/python3.9
+
+## This code is writtne for genotyping and filtering the VCF file from PL(phred scaled genotype likelihood)
+## Rewritten by Haechan in 220530 (reused VCF_genotype_filtering.py)
+
+
+# Import modules
+import sys
+import pandas as pd
+import gzip
+import time
+
+
+# INPUT
+INPUT = sys.argv[1]
+GL_CUTOFF = float(sys.argv[2])
+OUTPUT= sys.argv[3]
+
+# Global variables
+
+GENOTYPE = [2,1,0,9] # count reference allele
+# main
+
+def main():
+    start_time = time.time()
+    outfile = open(OUTPUT, 'w')
+    print('Trying to open file')
+    gzip_file = gzip.open(INPUT, 'r')
+    print('Open file')
+    i = 0
+    print('start parsing')
+    while True:
+        line = gzip_file.readline()
+        if not line:
+            break
+        line = line.decode()
+        if line[0:2] == "##":
+            continue
+        elif line[0] == "#":
+            VCF_header=line.replace('#', '').replace('\n', '').split('\t')
+            Individual = VCF_header[9:]
+        else:
+            variant_data = line.replace('\n', '').split('\t')
+            formatNum = len(variant_data[VCF_header.index('FORMAT')].split(':'))  # e.g. GT:AD:DP....
+            PL_index = variant_data[VCF_header.index('FORMAT')].split(':').index('PL')
+            geno = ''
+            for ind in Individual:
+                geno_field = variant_data[VCF_header.index(ind)].split(':')
+                if len(geno_field) != formatNum or geno_field[PL_index] == ".":
+                    geno += str(9)
+                else:
+                    GL_list = Cal_GL(geno_field[PL_index])
+                    GL_val = [i for i, GL in enumerate(GL_list) if GL >= GL_CUTOFF]
+                    GL_val.append(3)  # if there is no GL larger than GL_CUTOFF then we have to impute genotype as missing
+                    geno += str(GENOTYPE[GL_val[0]])
+            print(geno, sep="\t", file=outfile)
+            i += 1
+            if i % 10000 == 0:
+                print(f"{i}th SNP processed")
+    outfile.close()
+    end_time = time.time()
+    take_time = round((end_time-start_time)/60,2)
+    print(f"It takes {take_time} min")
+
+    return None
+
+def Cal_GL(PL):
+    GL_list = []
+    for prob in PL.split(','):
+        GL_list.append(10**-(0.1*int(prob)))
+    return [GL/sum(GL_list) for GL in GL_list]  # normalize
+
+
+main()
+
+##################################################
+###### 2. convert to Eigenstrat format ###########
+##################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+
+pt1=($(pwd)"/")
+of1=${pt1}"Bos.PL_0.9.X"
+fn1="/data1/PubData/CattleMerged_210420/VCF_filtering/Bos.biSNP.q30.X.vcf.gz"
+ind="/home/projects1/AnimalsHapSharing/595_DATA/Master.WGS.ind"
+
+## make snp file 
+zcat ${fn1} |awk '{OFS="\t"} { if ($1 !~ /#/) print $1":"$2,$1,"0.0",$2,$4,$5 }' > ${of1}.snp
+
+## make ind file 
+## X chromosome vcf includes only female, 317 individuals
+tr  '\t' '\n' < <(bcftools view -h ${fn1} |tail -n 1) |tail -n +10 > temp_1
+
+while read iid; do
+awk -v iid=$iid '{ if ( $1 == iid ) print $2 }' ../CombineGVCF595/New_sample_names.txt >> temp_2 ## substitute new sample name to old sample name
+done < temp_1
+
+while read iid; do
+awk -v iid=$iid '{ if ( $1 == iid ) print $0 }' ${ind} >>${of1}.ind
+done < temp_2
+
+rm temp*
+
+###########################################################################
+##### 3. Filter variants based on missingness and maf, conserving diversity between populations with Eigenstrat format ####
+############################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+
+pt1=($(pwd)"/")
+of1=${pt1}"Bos.PL_0.9"
+scf1=${pt1}"Calculate_stat_Eigen.sh"
+
+## prepare outgroup and ingroup individual file
+## Ingroup 288, Outgroup 28
+## calculate missingness and allele frequency per group
+
+awk '{OFS="\t"} {print $2,"U",$1}' Outgroup.fam > temp1
+awk '{OFS="\t"} {print $2,"U",$1}' Ingroup.fam > temp2
+
+while read iid sex pid; do
+awk -v iid=$iid '{ if ( $1 == iid ) print $0 }' temp1 >>Bos.F.Outgroup.ind
+done < ${of1}.ind
+
+while read iid sex pid; do
+awk -v iid=$iid '{ if ( $1 == iid ) print $0 }' temp2 >>Bos.F.Ingroup.ind
+done < ${of1}.ind
+
+sbatch -c 12 --mem 22000 --wrap="${scf1} ${of1}"
+
+## total allele : 8137397
+## Transversion : 2655412
+## Missingness : 2420090
+## Maf : 216138 (90% of SNPS filtered out no matter what is transition or transversion)
+
+
+
+############ save the following as "Calculate_stat_Eigen.sh" ###########
+#!/bin/bash
+
+fn1=$1
+chr="X"
+
+of1=${fn1}"."${chr}
+in1=${of1}".Ingroup"
+ot1=${of1}".Outgroup"
+ex1=${of1}"_ex_goat"
+tn1=${of1}"_temp"
+
+rn1="Bos.F.Ingroup.ind"
+rn2="Bos.F.Outgroup.ind"
+
+## except goat
+cn0s=""
+while read iid sex pid; do
+cn=($(awk -v iid="$iid" 'BEGIN {cn=""} {if ($1 == iid) cn=NR} END {print cn}' ${of1}.ind))
+if [[ "$cn0s" == "" ]]; then cn0s+=${cn}; else cn0s+=","${cn}; fi
+done < <(grep -v Goat ${of1}.ind)
+
+## Get the row number of the subset from the ind files
+## Outgroup without goat
+cn1s=""
+while read iid sex pid; do
+cn=($(awk -v iid="$iid" 'BEGIN {cn=""} {if ($1 == iid) cn=NR} END {print cn}' ${of1}.ind))
+if [[ "$cn1s" == "" ]]; then cn1s+=${cn}; else cn1s+=","${cn}; fi
+done < ${rn2}
+
+## Ingroup
+cn2s=""
+while read iid sex pid; do
+cn=($(awk -v iid="$iid" 'BEGIN {cn=""} {if ($1 == iid) cn=NR} END {print cn}' ${of1}.ind))
+if [[ "$cn2s" == "" ]]; then cn2s+=${cn}; else cn2s+=","${cn}; fi
+done < ${rn1}
+
+## Seperate GT of Outgroup and Ingroup
+cut -b${cn1s} ${of1}.geno > ${ot1}.geno
+cut -b${cn2s} ${of1}.geno > ${in1}.geno
+cut -b${cn0s} ${of1}.geno > ${ex1}.geno
+
+
+## Count number of missing alleles and ALT alleles in Outgroup
+nout=($(head -n 1 ${ot1}.geno| awk '{print length($0)}'))
+awk -F9 '{print NF-1}' ${ot1}.geno > ${tn1}_1
+awk -F1 '{print NF-1}' ${ot1}.geno > ${tn1}_2
+awk -F0 '{print 2*(NF-1)}' ${ot1}.geno > ${tn1}_3
+paste -d '\t' ${tn1}_1 ${tn1}_2 ${tn1}_3 |\
+awk -v nout="$nout" '{OFS="\t"} {if ($1 == nout) print $1/nout,0; else print $1/nout,($2+$3)/(2*(nout-$1)) }'  > ${ot1}.stat.txt #miss freq, alt allele freq
+
+
+## Count number of missing alleles and ALT alleles in ingroup
+nin=($(head -n 1 ${in1}.geno| awk '{print length($0)}'))
+awk -F9 '{print NF-1}' ${in1}.geno > ${tn1}_21
+awk -F1 '{print NF-1}' ${in1}.geno > ${tn1}_22
+awk -F0 '{print 2*(NF-1)}' ${in1}.geno > ${tn1}_23
+paste -d '\t' ${tn1}_21 ${tn1}_22 ${tn1}_23 |\
+awk -v nin="$nin" '{OFS="\t"} {if ($1 == nin) print $1/nin,0; else print $1/nin,($2+$3)/(2*(nin-$1)) }'  > ${in1}.stat.txt # miss freq, alt allele freq
+
+
+## Count number of missing alleles and ALT alleles in total group
+ntot=($(head -n 1 ${ex1}.geno| awk '{print length($0)}'))
+awk -F9 '{print NF-1}' ${ex1}.geno > ${tn1}_31
+awk -F1 '{print NF-1}' ${ex1}.geno > ${tn1}_32
+awk -F0 '{print 2*(NF-1)}' ${ex1}.geno > ${tn1}_33
+paste -d '\t' ${tn1}_31 ${tn1}_32 ${tn1}_33 | \
+awk -v ntot="$ntot" '{OFS="\t"} {if ($1 == ntot) print $1/ntot,0; else print $1/ntot,($2+$3)/(2*(ntot-$1)) }' > ${ex1}.stat.txt #miss freq, alt allele freq
+
+## make stat.txt
+
+echo -e "SNP\tREF\tALT\tIngroup_miss\tIngroup_freq\tOutgroup_miss\tOutgroup_freq\tTotal_miss\tTotal_freq" > ${of1}.stat.txt
+awk '{OFS="\t"} {print $1,$5,$6}' ${of1}.snp| paste -d '\t' - ${in1}.stat.txt ${ot1}.stat.txt ${ex1}.stat.txt >> ${of1}.stat.txt ## Except goat
+
+## only transversion and except monomorphic and 100% missing either in outgroup or ingroup
+## ingroup & outgroup maf 0.05
+## Missingness filtering ( Ingroup < 0.2 && Outgroup < 0.6) 
+
+echo -e "SNP\tREF\tALT\tIngroup_miss\tIngroup_freq\tOutgroup_miss\tOutgroup_freq\tTotal_miss\tTotal_freq" > ${of1}.tv.stat.txt
+tail -n +2 ${of1}.stat.txt | \
+awk '{if ( !(( $2 == "A" && $3 == "G" ) || ($2 == "G" && $3 == "A" ) || ($2 == "C" && $3 == "T" ) || ($2 == "T" && $3 == "C" )) && ($4 < 0.2 && $6 < 0.6) &&  !($5 <= 0.05 && $7 <= 0.05) && !($5 >= 0.95 && $7 >= 0.95)  ) print $0}' >> ${of1}.tv.stat.txt
+
+tail -n +2 ${of1}.stat.txt |paste - ${of1}.geno | \
+awk '{if ( !(( $2 == "A" && $3 == "G" ) || ($2 == "G" && $3 == "A" ) || ($2 == "C" && $3 == "T" ) || ($2 == "T" && $3 == "C" )) && ($4 < 0.2 && $6 < 0.6) &&  !($5 <= 0.05 && $7 <= 0.05) && !($5 >= 0.95 && $7 >= 0.95) ) print $10}'  > ${of1}.tv.geno
+
+awk '{print $1}' ${of1}.tv.stat.txt | tail -n +2 | LC_ALL=C fgrep -wf - ${of1}.snp  > ${of1}.tv.snp
+
+rm ${tn1}*; rm ${ot1}*; rm ${in1}*; rm ${ex1}*
+
+###############################################
+#### Plot frequency and missingness table ########
+###############################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+
+pt1=($(pwd)"/")
+scf=${pt1}"Calculate_heatmap_220721.R"
+of1=${pt1}"Bos.PL_0.9.X.tv"
+
+sbatch -c 24 --mem 45000 --wrap="${scf} ${of1}" 
+
+########### save the following as "Calculate_heatmap_220721.R" #############
+
+#! /usr/bin/env Rscript
+
+setwd(getwd())
+
+args = commandArgs(trailingOnly=TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+
+## heatmap for allele frequency (ingroup X outgroup) for filtered
+
+of1 <- args[1]
+stat <- read.table(file=paste0(of1,".stat.txt"),header=T)
+
+freq <- matrix(nrow=22,ncol=22)
+freq_row <- vector()
+freq_col <- vector()
+
+for (i in 1:22){
+  if (i < 21) {
+    freq_row <- c(freq_row,paste0("in<=",(i-1)*0.05))
+    freq_col <- c(freq_col,paste0("out<=",(i-1)*0.05))
+  }
+  else if (i==21){
+    freq_row <- c(freq_row,paste0("in<",(i-1)*0.05))
+    freq_col <- c(freq_col,paste0("out<",(i-1)*0.05))
+  }
+  else {
+    freq_row <- c(freq_row,paste0("in=1"))
+    freq_col <- c(freq_col,paste0("out=1"))
+  }
+}
+
+rownames(freq) <- freq_row
+colnames(freq) <- freq_col
+
+
+for (i in 1:22){
+  for (j in 1:22){
+    if (i < 21 & j < 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq <= (i-1)*0.05 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq <= (j-1)*0.05 ))
+    }
+    else if (i == 21 & j < 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq < (i-1)*0.05 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq <= (j-1)*0.05 ))
+    }
+    else if (i < 21 & j == 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq <= (i-1)*0.05 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq < (j-1)*0.05 ))
+    }
+    else if (i == 21 & j == 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq < (i-1)*0.05 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq < (j-1)*0.05 ))
+    }
+    else if (i == 22 & j < 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq == 1 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq <= (j-1)*0.05 ))
+    }
+    else if (i == 22 & j == 21) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq == 1 &  Outgroup_freq > (j-2)*0.05 & Outgroup_freq < (j-1)*0.05 ))
+    }
+    else if (i < 21 & j == 22) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq <= (i-1)*0.05 &  Outgroup_freq == 1 ))
+    }
+    else if (i == 21 & j == 22) {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq > (i-2)*0.05 & Ingroup_freq < (i-1)*0.05 &  Outgroup_freq == 1 ))
+    }
+    else {
+      freq[i,j] <- nrow(subset(stat, Ingroup_freq == 1 &  Outgroup_freq == 1 ))
+    }
+  }
+}
+
+pdf(paste0(of1,".freq.pdf"),width=10,height=10)
+
+pheatmap(freq, display_numbers = round(freq,0), color = colorRampPalette(c('white','red'))(100),
+         cluster_rows = F, cluster_cols = F, fontsize_number = 8, main="frequency"
+)
+
+dev.off()
+
+Miss <- matrix(nrow=22,ncol=22)
+Miss_row <- vector()
+Miss_col <- vector()
+
+for (i in 1:22){
+  if (i < 21) {
+    Miss_row <- c(Miss_row,paste0("in<=",(i-1)*0.05))
+    Miss_col <- c(Miss_col,paste0("out<=",(i-1)*0.05))
+  }
+  else if (i==21){
+    Miss_row <- c(Miss_row,paste0("in<",(i-1)*0.05))
+    Miss_col <- c(Miss_col,paste0("out<",(i-1)*0.05))
+  }
+  else {
+    Miss_row <- c(Miss_row,paste0("in=1"))
+    Miss_col <- c(Miss_col,paste0("out=1"))
+  }
+}
+
+rownames(Miss) <- Miss_row
+colnames(Miss) <- Miss_col
+
+
+for (i in 1:22){
+  for (j in 1:22){
+    if (i < 21 & j < 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss <= (i-1)*0.05 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss <= (j-1)*0.05 ))
+    }
+    else if (i == 21 & j < 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss < (i-1)*0.05 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss <= (j-1)*0.05 ))
+    }
+    else if (i < 21 & j == 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss <= (i-1)*0.05 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss < (j-1)*0.05 ))
+    }
+    else if (i == 21 & j == 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss < (i-1)*0.05 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss < (j-1)*0.05 ))
+    }
+    else if (i == 22 & j < 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss == 1 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss <= (j-1)*0.05 ))
+    }
+    else if (i == 22 & j == 21) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss == 1 &  Outgroup_miss > (j-2)*0.05 & Outgroup_miss < (j-1)*0.05 ))
+    }
+    else if (i < 21 & j == 22) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss <= (i-1)*0.05 &  Outgroup_miss == 1 ))
+    }
+    else if (i == 21 & j == 22) {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss > (i-2)*0.05 & Ingroup_miss < (i-1)*0.05 &  Outgroup_miss == 1 ))
+    }
+    else {
+      Miss[i,j] <- nrow(subset(stat, Ingroup_miss == 1 &  Outgroup_miss == 1 ))
+    }
+  }
+}
+
+pdf(paste0(of1,".miss.pdf"),width=10,height=10)
+
+pheatmap(Miss, display_numbers = round(Miss,0), color = colorRampPalette(c('white','red'))(100),
+         cluster_rows = F, cluster_cols = F, fontsize_number = 8, main="Missingness"
+)
+
+dev.off()
+
+
+
+###################################
+#### 4. maf filtering  ######
+##################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+
+pt1=($(pwd)"/")
+of1=${pt1}"Bos.PL_0.9.X"
+
+## maf filter
+## filter SNP whose maf of Outgroup <=0.15 && Ingroup <=0.05 do not segregate differently in both group. 
+## 199,417 SNPs left
+
+echo -e "SNP\tREF\tALT\tIngroup_miss\tIngroup_freq\tOutgroup_miss\tOutgroup_freq\tTotal_miss\tTotal_freq" > ${of1}.maf.stat.txt
+tail -n +2 ${of1}.tv.stat.txt | \
+awk '{if ( !($5 <= 0.05 && $7 <= 0.15) && !($5 >= 0.95 && $7 >= 0.85) ) print $0}' >> ${of1}.maf.stat.txt
+
+tail -n +2 ${of1}.tv.stat.txt |paste - ${of1}.tv.geno | \
+awk '{if ( !($5 <= 0.05 && $7 <= 0.15) && !($5 >= 0.95 && $7 >= 0.85) ) print $10}'  > ${of1}.maf.geno
+
+awk '{print $1}' ${of1}.maf.stat.txt | tail -n +2 | LC_ALL=C fgrep -wf - ${of1}.tv.snp  > ${of1}.maf.snp
+
+cp ${of1}.ind ${of1}.maf.ind 
+
+cp ${of1}.maf.* ./filtering/
+
+###################################
+#### 5. mappability filtering  ######
+##################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering
+mkdir -p mappability; cd mappability
+
+pt1=($(pwd)"/")
+of1="/data1/PubData/CattleMerged_210420/genotype/Bos.PL_0.9"
+fn1=${pt1}"Bos.PL_0.9"
+msk="/home/projects1/AnimalsHapSharing/MSMC/mappability/ARS-UCD1.2_chr" ## use mask bed file from msmc analysis
+
+### filtering based on mappability
+fgrep -wf ${fn1}.X.maf.masked.snp.txt ${of1}.X.maf.snp > ${of1}.X.mappable.snp
+paste ${of1}.X.maf.snp ${of1}.X.maf.geno |fgrep -wf ${fn1}.X.maf.masked.snp.txt -|awk '{print $7}' > ${of1}.X.mappable.geno
+
+###################################
+#### 1. calculate distance between SNPs  ######
+##################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/
+mkdir -p filtering; cd filtering
+
+pt1=($(pwd)"/")
+of1="Bos.PL_0.9.X.mappable"
+fn1=${of1}".distance.txt" 
+
+## calculate the distance between snps
+## put NA on the first and last SNP
+awk 'NR > 1 { print $4 - prev } { prev = $4 }' ${of1}.snp > temp_${of1}_right.txt
+echo "NA" > temp_${of1}_left.txt
+cat temp_${of1}_right.txt >> temp_${of1}_left.txt
+echo "NA" >> temp_${of1}_right.txt
+
+## cbind distance data between SNPs
+## $7: Distance to the nearest left SNP
+## $8: Distance to the nearest right SNP 
+paste ${of1}.snp temp_${of1}_left.txt temp_${of1}_right.txt  > temp2_${of1}.txt
+
+## put NA on the first and last SNP per chromosome
+awk '{$7=($7<0)?"NA":$7}1' OFS='\t' temp2_${of1}.txt > temp3_${of1}.txt
+awk '{$8=($8<0)?"NA":$8}1' OFS='\t' temp3_${of1}.txt > ${fn1}
+
+## remove temporary files
+rm temp*
+
+
+
+##################################################
+#### 2. Get SNP range file and calculate SNP panel statistics   ####
+##################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+
+pt1=($(pwd)"/")
+of1="Bos.PL_0.9.X.mappable"  ## maf, TV. missingness filtered SNP set
+reff="/home/References/Cattle/ARS-UCD1.2.chrY.fa" ## Reference fasta file
+
+fn1=${of1}".temp_summary.txt"
+
+## Make SNP range file
+## This takes about 3 min.
+nchr=X
+endsnp=($(awk -v nchr=$nchr '{if ($1 == nchr) print $2}' ${reff}.fai))
+for bp in 52 500; do
+	of3=${of1}"."${bp}".rgn"
+	awk -v bp=$bp -v endsnp=$endsnp -v nchr=$nchr 'BEGIN {FS=":"} {OFS=":"} {if ($1 == nchr && $2-bp >= 0 && $2+bp <= endsnp) {print $1,$2-bp"-"$2+bp} \
+	else if ($1 == nchr && $2-bp >= 0 && $2+bp > endsnp) {print $1,$2-bp"-"endsnp} else if ($1 == nchr && $2-bp < 0 && $2+bp <= endsnp) {print $1,"0-"$2+bp} \
+	else if ($1 == nchr && $2-bp < 0 && $2+bp > endsnp) {print $1,"0-"endsnp}}' ${of1}.snp >> ${of3}
+done
+
+
+## Run samtools faidx (takes about 3 min.)
+for bp in 52 500; do
+	of3=${of1}"."${bp}".rgn"
+	lth=`expr $bp \* 2 + 1`
+	samtools faidx ${reff} -r ${of3} -n ${lth} -o ${of1}.${bp}.fa
+done
+
+## Calculate SNP panel statistics
+## slurm jobs take about 5 ~ 15 min.
+for bp in 52 500; do
+	sbatch -c 4 --mem=8000 --wrap="awk '{if (NR%2 == 0) print gsub(/[a,t,g,c]/,//)}' ${of1}.${bp}.fa > lcnumber_${bp}_tmp.txt"
+	sbatch -c 4 --mem=8000 --wrap="awk '{if (NR%2 == 0) print gsub(/[gGcC]/,//)}' ${of1}.${bp}.fa > gc_${bp}_tmp.txt"
+	sbatch -c 4 --mem=8000 --wrap="awk '{if (NR%2 == 0) print gsub(/[gGcCaAtT]/,//)}' ${of1}.${bp}.fa > gcat_${bp}_tmp.txt"
+	sbatch -c 4 --mem=8000 --wrap="awk '{if (NR%2 == 0) print gsub(/[Nn]/,//)}' ${of1}.${bp}.fa > Nnnumber_${bp}_tmp.txt"
+done
+
+awk '{print $1}' ${of1}.distance.txt > SNP_tmp.txt
+awk '{print $7}' ${of1}.distance.txt > left_tmp.txt
+awk '{print $8}' ${of1}.distance.txt > right_tmp.txt
+
+
+for bp in 52 500; do
+	of3=${of1}"."${bp}".rgn"
+	awk 'BEGIN {FS="[:-]"} {print $3-$2+1}' ${of3} > length_${bp}_tmp.txt
+	paste lcnumber_${bp}_tmp.txt length_${bp}_tmp.txt | awk '{print ($1/$2)}' > lcrate_${bp}_tmp.txt
+	paste gc_${bp}_tmp.txt gcat_${bp}_tmp.txt | awk '{print ($1/$2)}' > GCcontent_${bp}_tmp.txt
+	paste Nnnumber_${bp}_tmp.txt length_${bp}_tmp.txt | awk '{print ($1/$2)}' > Nnrate_${bp}_tmp.txt
+done
+
+## Summarize SNP panel statistics
+echo -e "SNP\tleft\tright\tlcrate_500\tGCcontent_500\tN/nrate_500\tlcrate_52\tGCcontent_52\tN/nrate_52" > ${fn1}
+
+paste SNP_tmp.txt left_tmp.txt right_tmp.txt  lcrate_500_tmp.txt GCcontent_500_tmp.txt Nnrate_500_tmp.txt lcrate_52_tmp.txt GCcontent_52_tmp.txt Nnrate_52_tmp.txt >> ${fn1}
+
+rm *_tmp.txt
+rm slurm-*
+
+
+
+##########################################################################
+## 3. Script to sum coverage by window of ancient bos data            ##
+##   - mapping to filtered SNP panel(missingness,maf,tv filtered)          ##
+##   - calculate total coverage and percentile by window                ##
+##   - combine with existing summary file (Bos.PL_0.9.X.maf.temp_summary.txt)       ##
+#########################################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+
+pt1=($(pwd)"/")
+listf=${pt1}"Dairycattle_bamlist_220719.txt"
+scf1=${pt1}"Calculate_coverage_per_window.sh"
+window=5000
+slist=${pt1}"Bos.PL_0.9.X.mappable.snp"
+
+of1=${pt1}"Bos.PL_0.9.X.mappable.coverage.txt"
+of2=${pt1}"Bos.PL_0.9.X.mappable.temp_summary.txt"
+of3=${pt1}"Bos.PL_0.9.X.mappable.final.summary.txt"
+
+## extract position from snp panel
+awk -v win=${window} '{OFS="\t";print $2,int(($4-1)/win)*win+1,$1}' ${slist} > temp_snp_win${window}.txt
+
+## join the total coverage of windows to snp panel
+echo -e 'SNP\tChr\tWin\tCov\tPCTL' > ${of1}
+awk -F'\t' 'NR==FNR {h[$1,$2]=$0;next} {OFS="\t";print $3, h[$1,$2]}' ancient_coverage_win${window}_sum_percentile.txt temp_snp_win${window}.txt >> ${of1}
+
+
+## Summarize ancient coverage data to SNP panel statistics
+awk '{OFS="\t"}{print $3,$4,$5}' ${of1} |paste ${of2} - > ${of3}
+
+
+
+##################################
+## Plot summary statistics      ##
+##################################
+
+R
+rm(list=ls())
+setwd(getwd())
+
+## Import result file
+fn1 = "Bos.PL_0.9.X.mappable.final"
+of1 = paste0(fn1,".summary.txt")
+d1 = read.table(of1, header = T)
+d1 = d1[c(4,5,7,8,11)]
+
+## calculate quantile for lcrate_500, GCcontent_500, Ancient Coverage
+quantile(d1[,1],prob=c(0.85,0.90,0.95,0.99))
+write(quantile(d1[,2],prob=c(0.01,0.025,0.975,0.99)), file="X_GCcontents_500_percentile.txt",sep = "\t")
+write(quantile(d1[,5],prob=c(0.01,0.025,0.975,0.99)), file="X_AncCov_percentile.txt",sep = "\t")
+
+## plotting
+pdf.name = paste0(fn1,".densityplot.pdf")
+pdf(pdf.name, height=7, width=11)
+par(mar=c(5.1, 4.6, 4.1, 1.1)); par(cex.axis=1.3, cex.lab=1.3, cex.main=1.3)
+
+for (k in 1:5){
+  ## Define bin size
+  ivals = c(0.005, 0.005, 0.01, 0.01, 100, 0.001)
+  ival = ivals[k]
+  nval = names(d1)[k]
+  tv1 = as.numeric(as.vector(as.matrix(d1[,k])))
+  tfv1 = !is.na(tv1)
+  tv1 = tv1[tfv1]
+  
+  xmin1 = floor(quantile(tv1, 0.01)/ival)*ival    ##  1% percentile
+  xmax1 = ceiling(quantile(tv1, 0.99)/ival)*ival  ## 99% percentile
+  ivec = seq(xmin1, xmax1, ival)
+  xv1 = ivec - ival/2
+  
+  tyv1 = unlist(lapply(ivec, function(x) sum(tv1 <= x)))
+  yv1 = tyv1 - c(sum(tv1 < xmin1), tyv1[1:(length(tyv1)-1)])
+  ymax1 = max(c(yv1))
+  
+  plot(c(xmin1,xmax1),c(0,ymax1), type="n", xlab=nval, ylab="density", main="Bos.X.200K")
+  polygon(x=c(xv1, rev(xv1)), y=c(yv1, rep(0, length(yv1))), col="#0000FF55", border=NA)
+}
+
+dev.off()
+
+
+###################################################################
+##  Set threshold, filter SNPs, and make final 974K SNP panel    ##
+##  Get ~51,800 SNPs from X                              ##
+###################################################################
+#################################################
+## 4. Set threshold and filter SNPs            ##
+#################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+
+pt1=($(pwd)"/")
+fn1=${pt1}"Bos.PL_0.9.X.mappable.final.summary.txt" ## 138,548 SNps
+fn2=${pt1}"Bos.PL_0.9.X.mappable.final.summary_filtered.txt"
+
+## Filter +-52bp close SNP (120,943 SNPs)
+tail -n +2 ${fn1} | awk '{if ($2 > 52 ) print $0}' | wc -l
+
+## + add filter +-500bp N/n rate is 0 (120,943 SNPs)
+tail -n +2 ${fn1} | awk '{if ($2 > 52 && $6 == 0) print $0}' | wc -l
+
+## + add filter 0.298 < GCcontent_500 < 0.514 (95%, 114,845 SNPs)
+tail -n +2 ${fn1} | awk '{if ($2 > 52 && $6 == 0 && $5 > 0.298 && $5 < 0.514) print $0}' | wc -l
+
+## + add filter 27999 < anc_Cov < 66728 (95%, 109,452 SNPs)
+tail -n +2 ${fn1} | awk '{if ($2 > 52 && $6 == 0 && $5 > 0.298 && $5 < 0.514 && $11 > 27999 && $11 < 66728) print $0}' | wc -l
+
+## + add filter lcrate_500 < 0.9 (105,794 SNPs)
+tail -n +2 ${fn1} | awk '{if ($2 > 52 && $6 == 0 && $5 > 0.298 && $5 < 0.514 && $11 > 27999 && $11 < 66728 && $4 < 0.9) print $0}' | wc -l
+
+## Make filtered SNP set
+awk '(NR == 1) {print $0}' ${fn1} > ${fn2}
+awk '(NR > 1) {if ($2 > 52 && $6 == 0 && $5 > 0.298 && $5 < 0.514 && $11 > 27999 && $11 < 66728 && $4 < 0.9) print $0}' ${fn1} >> ${fn2}
+
+## no thinning
+
+##############################
+## Plot SNP distribution    ##
+
+R
+
+rm(list=ls())
+library(ggplot2)
+
+## import data
+fn1="Bos.PL_0.9.X.mappable.final"
+d1 = read.table(file=paste0(fn1,".summary_filtered.txt"), header = T)
+SNP=d1[,1] ## only snp id
+ds=data.frame(SNP)
+
+## extract chromosome and position info from snp id
+snp_loc <- data.frame(do.call('rbind', strsplit(as.character(ds$SNP), split=":", fixed = TRUE)))
+d2 <- cbind(ds, snp_loc)
+colnames(d2) <- c("SNP", "Chr", "Pos")
+
+d1$Pos <- as.numeric(as.character(d2$Pos))
+
+## plotting
+d2$Chr_name = paste0("Chr",d2$Chr)
+
+pdf.name = paste0(fn1,".Position_Distributionplot.pdf")
+pdf(pdf.name, height=7, width=11)
+
+color_palette=c("#4E79A7", "#A0CBE8", "#F28E2B", "#FFBE7D", "#59A14F", "#8CD17D", "#B6992D", "#F1CE63", 
+                "#499894", "#86BCB6", "#E15759", "#FF9D9A", "#79706E", "#BAB0AC", "#D37295", "#FABFD2", 
+                "#B07AA1", "#D4A6C8", "#9D7660", "#D7B5A6", "#3ca8bc", "#98d9e4", "#4e9f50", "#ef8a0c",
+                "#8dbfa8", "#f1788d", "#AEC7E8", "#FFBB78", "#F7B6D2")
+ggplot(d2, aes(x=as.numeric(Pos))) +
+    geom_histogram(binwidth=1000000) +
+    theme_bw() +
+    theme(legend.position="none") +
+    labs(x="Genome Position", y="count(bin: 1 Mb)")
+
+dev.off()
+
+pdf.name = paste0(fn1,".Coverage_histogram.pdf")
+pdf(pdf.name, height=7, width=11)
+
+ggplot(d1, aes(x=as.numeric(Cov))) +
+    geom_histogram(binwidth=100) +
+    theme_bw() +
+    theme(legend.position="none") +
+    labs(x="Coverage", y="count(bin: 1 Mb)")
+
+#min(d1[d1$Pos>133000000,]$Cov)
+
+ggplot(d1[d1$Pos>133000000,], aes(x=as.numeric(Cov))) +
+    geom_histogram(binwidth=100) +
+    theme_bw() +
+    theme(legend.position="none") +
+    labs(x="Coverage (>133Mb)", y="count(bin: 1 Mb)")
+
+dev.off()
+
+
+
+#################################################################
+## 5. Discover NUMTs in our reference fasta using BLASTN       ##
+#################################################################
+
+########################################################################
+## 5_1. Count number of SNPs in NUMT regions                          ##
+########################################################################
+
+cd /data1/PubData/CattleMerged_210420/analysis/Bos_BLAST/
+
+pt1=($(pwd)"/")
+NUMTf=${pt1}"NUMT_blast.tsv"
+snpf="/data1/PubData/CattleMerged_210420/genotype/filtering/Bos.PL_0.9.X.mappable.snp"
+of1=${pt1}"NUMT_X_SNPcount_220721.txt"
+
+## Count how many SNPs are in each NUMT region
+while read -r sseqid sstart send; do
+    awk -v sseqid="$sseqid" -v sstart="$sstart" -v send="$send" '{if ($2 == sseqid && $4 >= sstart && $4 <= send) print $0}' ${snpf} >> ${of1}
+done < <(tail -n +2 ${NUMTf} | awk '{print $2,$7,$8}')
+
+## 6 SNPs in Bos X SNP set are overlapped with the NUMT regions
+## These 6 SNPs must be excluded
+
+###############################################################################
+## 5_2. Exclude NuMT SNPs from 1315K SNP set                                 ##
+##      and remove head and tail SNPs which have distance less than 52bp     ##
+###############################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+
+pt1=($(pwd)"/")
+rn1="/data1/PubData/CattleMerged_210420/analysis/Bos_BLAST/NUMT_X_SNPcount_220721.txt" ## 6 NuMT SNPs in chrX set
+rn2=${pt1}"Bos.PL_0.9.X.mappable.final.summary_filtered.txt" ## filtered  105,794 SNPs
+snplf=${pt1}"noNuMT_Bos_chrX_SNP.txt"
+fn1="/data1/PubData/CattleMerged_210420/genotype/Bos.PL_0.9.X.mappable" ## maf, TV, mappability 
+of1=${pt1}"Bos.X.noNuMT"
+
+awk 'NR == FNR {a[$1]; next} !($1 in a) {OFS="\t"; if (FNR > 1) print $1}' ${rn1} ${rn2} > ${snplf} ## 105,791 SNP set (3 SNPs are overlapped)
+
+## Extract filtered SNPs from SNP panel
+LC_ALL=C fgrep -wf ${snplf} ${fn1}.snp > ${of1}.snp
+paste ${fn1}.snp ${fn1}.geno|LC_ALL=C fgrep -wf ${snplf} - | awk '{print $7}' > ${of1}.geno
+cp ${fn1}.ind ${of1}.ind
+
+###################################################################
+##  6. LD pruning script to make  autosome SNP set of Bos  ##
+###################################################################
+###################################################################
+## prepare three SNP sets
+## 1. Our SNP panel = 922K(autosome) + 52K(chrX) ## Bos.974K.auto, Bos.974K.X
+## 2. Our SNP panel (807K(autosome) + 46K(chrX)) +  BovineHD(tv)(121K) = 974K ## Bos.853K.auto, Bos.853K.X
+## 3. Our SNP panel (304K(autosome) + 17K(chrX)) +  BovineHD(653K) = 974K ## Bos.321K.auto , Bos.321K.X  
+###########################################################################
+## 6-1. Convert EIGENSTRAT format file into a PLINK format file          ##
+###########################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+mkdir -p LD_pruning; cd LD_pruning
+
+pt1=($(pwd)"/")
+fn1="/data1/PubData/CattleMerged_210420/genotype/filtering/Bos.X.noNuMT"
+of1=${pt1}"Bos.X.noNuMT"
+tn1="temp1_"${of1}
+
+## Write a parameter file for converting into PLINK format
+echo "genotypename: "${fn1}".geno" > ${of1}.par
+echo "snpname: "${fn1}".snp" >> ${of1}.par
+echo "indivname: "${fn1}".ind" >> ${of1}.par
+echo "outputformat:    PACKEDPED" >> ${of1}.par
+echo "genotypeoutname: "${of1}".bed" >> ${of1}.par
+echo "snpoutname: "${of1}".bim" >> ${of1}.par
+echo "indivoutname:  "${of1}".fam" >> ${of1}.par   
+echo "numchrom: 29" >> ${of1}.par
+
+## Run convertf
+sbatch -c 16 --mem 30000 --wrap="convertf -p "${of1}".par"
+
+
+## Remove temporary files
+rm ${tn1}_*; rm slurm-*
+
+
+#########################################################################
+## 6-2. Extract LD pruned markers in PLINK                             ##
+##      Then convert the output file into the EIGENSTRAT format        ##
+#########################################################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/LD_pruning/
+
+pt1=($(pwd)"/")
+fn1=${pt1}"Bos.X.noNuMT"
+of1="Bos.X.noNuMT.LDpruned"
+tn1="temp1_"
+nchr=29
+
+listf=${pt1}"Label_txt_X.txt" ## $1=ld, $2=label
+
+## Extracting markers for pruning based on LD in PLINK and make a new pruned file.
+## 1.Bos.974K.X
+## 54,766 of 105K variants were left in r^2 = 0.95
+## Later, shuffle out 2,766 SNPs to make 52K
+plink --bfile ${fn1} --cow --indep-pairwise 50 5 0.95
+plink --bfile ${fn1} --extract plink.prune.in --cow --make-bed --out ${of1}".0.95"
+
+## 2.Bos.853K.X
+## 46,377 of 105K variants were left in r^2 = 0.9
+## Later, shuffle out 377 SNPs to make 46K
+plink --bfile ${fn1} --cow --indep-pairwise 50 5 0.9
+plink --bfile ${fn1} --extract plink.prune.in --cow --make-bed --out ${of1}".0.9"
+
+## 3.Bos.321K.X
+## 17,184 of 105K variants were left in r^2 = 0.5
+## Later, shuffle out 184 SNPs to make 17K
+plink --bfile ${fn1} --cow --indep-pairwise 50 5 0.5
+plink --bfile ${fn1} --extract plink.prune.in --cow --make-bed --out ${of1}".0.5"
+
+## Convert PLINK format file into EIGENSTRAT format file
+
+## Write a parameter file for converting into EIGENSTRAT format
+while read ld name; do
+fn2="Bos.X.noNuMT.LDpruned."${ld}
+of2=${name}
+echo "genotypename: "${fn2}".bed" > ${of2}.par
+echo "snpname: "${fn2}".bim" >> ${of2}.par
+echo "indivname: "${fn2}".fam" >> ${of2}.par
+echo "outputformat:    EIGENSTRAT" >> ${of2}.par
+echo "genotypeoutname: "${of2}".geno" >> ${of2}.par
+echo "snpoutname: "${of2}".snp" >> ${of2}.par
+echo "indivoutname:  "${of2}".ind" >> ${of2}.par   
+echo "numchrom: 29" >> ${of2}.par
+sbatch -c 16 --mem 30000 --wrap="convertf -p "${of2}".par"
+done < ${listf}
+## Remove temporary files
+rm ${tn1}*
+
+###################################
+### 6-3. Combine SNPset with BovineHD ###
+###################################
+
+cd /data1/PubData/CattleMerged_210420/genotype/filtering/
+mkdir -p SNPset1;mkdir -p SNPset2;mkdir -p SNPset3
+
+pt1=($(pwd)"/")
+dt1="/data1/PubData/CattleMerged_210420/genotype/filtering/Bos.X.noNuMT"
+
+### SNPset1
+### plink change polarity so we should recover it
+fn1="/data1/PubData/CattleMerged_210420/genotype/filtering/LD_pruning/Bos.974K.X"
+of1=${pt1}"SNPset1/Bos.974K.X"
+
+awk '{print $1}' ${fn1}.snp|LC_ALL=C fgrep -wf - ${dt1}.snp > ${of1}.snp
+paste ${dt1}.snp ${dt1}.geno| LC_ALL=C fgrep -wf ${of1}.snp -|awk '{print $7}' > ${of1}.geno
+cp ${dt1}.ind ${of1}.ind
+
+### SNPset2
+fn2="/data1/PubData/CattleMerged_210420/genotype/filtering/LD_pruning/Bos.853K.X"
+of2=${pt1}"SNPset2/Bos.853K.X"
+
+awk '{print $1}' ${fn2}.snp|LC_ALL=C fgrep -wf - ${dt1}.snp > ${of2}.snp
+paste ${dt1}.snp ${dt1}.geno| LC_ALL=C fgrep -wf ${of2}.snp -|awk '{print $7}' > ${of2}.geno
+cp ${dt1}.ind ${of2}.ind
+
+### SNPset3
+fn3="/data1/PubData/CattleMerged_210420/genotype/filtering/LD_pruning/Bos.321K.X"
+of3=${pt1}"SNPset3/Bos.321K.X"
+
+awk '{print $1}' ${fn3}.snp|LC_ALL=C fgrep -wf - ${dt1}.snp > ${of3}.snp
+paste ${dt1}.snp ${dt1}.geno| LC_ALL=C fgrep -wf ${of3}.snp -|awk '{print $7}' > ${of3}.geno
+cp ${dt1}.ind ${of3}.ind
+

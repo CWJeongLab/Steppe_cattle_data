@@ -1,0 +1,557 @@
+#######################################################
+## 1. Process the capture sequencing data (n=27)      ##
+#######################################################
+
+cd /home/projects1/DairyCultures/DataProcessing/
+
+pt1=($(pwd)"/")
+listf=${pt1}"Animals_DairyCultures_capture_batch01_list_r1.txt"
+reff="/home/projects1/DataProcessing_MPI/reflist.txt"
+snpfl="/home/projects1/DairyCultures/genotypes/snpf_panel_list_per_species.txt" # 974K panel for each species 
+scf1=${pt1}"Jeonglab_dataprocessing_ancient_240228.sh"
+
+## Submit the job
+idnmax=($(wc -l ${listf} ))
+nperrun=12
+
+#sbatch --array=1-${idnmax}%${nperrun} -c 8 --mem 15000 -J mapping --wrap=${scf1}" "${listf}" "${reff}" "${snpfl}
+
+## Remove temporary files after the jobs are finished
+rm slurm-*
+
+## Get the mapDamage plots
+btn="batch01"
+s1s=""; s2s=""
+while read -r iid lid rid fq type spp; do
+    for sp in $(echo ${spp} | sed s/","/" "/g); do
+        sid=${rid}"."${sp}
+        tfn1=($(realpath ./${iid}/mapDamage/${sid}/Fragmisincorporation_plot.pdf))
+        tfn2=($(realpath ./${iid}/mapDamage/${sid}/Length_plot.pdf))
+        if [ -f ${tfn1} ] ; then s1s+=" "${tfn1}; fi
+        if [ -f ${tfn2} ] ; then s2s+=" "${tfn2}; fi
+    done
+done < ${listf}
+
+pdfunite ${s1s} Animals_DairyCultures_capture_${btn}_Frag.pdf
+pdfunite ${s2s} Animals_DairyCultures_capture_${btn}_Len.pdf
+
+## Get the summary files
+tnum1=0
+of1=${pt1}"Animals_DairyCultures_capture_"${btn}"_mapping_summary.txt"
+
+while read -r iid lid rid fq type spp; do
+    for sp in $(echo ${spp} | sed s/","/" "/g); do
+        sid=${rid}"."${sp}
+        tfn1=($(realpath ./${iid}/summary/${sid}/${sid}.summary.txt))
+        if [ "$tnum1" -eq 0 ]; then head -1 ${tfn1} > ${of1}; let tnum1+=1; fi
+        tail -n +2 ${tfn1} >> ${of1}
+    done
+done < ${listf}
+
+
+######################################################################################
+##### write the following script as "Jeonglab_dataprocessing_ancient_240228.sh" ######
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+listf=$1   ## A list of samples to be processed (ID, LID, RID, FastQs, type, reference)
+reff=$2    ## the reference genome list file
+snpfl=$3   ## snp/pos file
+inum=$SLURM_ARRAY_TASK_ID
+
+iid=($(awk -v inum="$inum" '{if (inum == NR) print $1}' ${listf}))   ## Individual ID
+lid=($(awk -v inum="$inum" '{if (inum == NR) print $2}' ${listf}))   ## library ID
+rid=($(awk -v inum="$inum" '{if (inum == NR) print $3}' ${listf}))   ## run ID
+tfqs=($(awk -v inum="$inum" '{if (inum == NR) print $4}' ${listf}))  ## comma separated FastQ files
+type=($(awk -v inum="$inum" '{if (inum == NR) print $5}' ${listf}))  ## library type
+spp=($(awk -v inum="$inum" '{if (inum == NR) print $6}' ${listf}))   ## comma separated reference list
+
+seedval="32"; if [[ "$type" == "ssLib" ]] || [[ "$type" == "non-UDG" ]]; then seedval="9999"; fi
+nrmax=100000
+
+start_time=($(date "+%s"))
+
+## Create directories
+mkdir -p ./${iid}/FastQ/ ./${iid}/BAM/ ./${iid}/mapDamage/ ./${iid}/qualimap/ ./${iid}/genotypes/ ./${iid}/summary/
+
+
+##############################################################
+## Part 1. Run AdapterRemoval (keep 35 bp or longer reads)  ##
+
+## Common options for AdapterRemoval; keep minlength 35 bps
+optstr="--gzip --threads 8 --trimns --trimqualities "
+optstr+="--adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC "
+optstr+="--adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA "
+optstr+="--minlength 35 --minquality 20 --minadapteroverlap 1"
+
+cd ${pt1}${iid}/FastQ/
+mkdir -p ${rid}; cd ${rid}
+
+echo -e "\n\n\n"
+echo "################################ 1. Adapter Removal ###################################"
+echo -e "\n\n\n"
+
+## Take a list of FastQ files and decide if they are SE or PE
+stval=($(echo ${tfqs} | sed s/","/"\n"/g | awk '$1 ~ /_R2/ || $1 ~ /_2.fastq.gz/ || $1 ~ /_2.fq.gz/' | wc -l | awk '{if ($1 > 0) print "PE"; else print "SE"}'))
+
+echo -e "This library was "${stval}" sequenced.\n"
+
+fq1s=""
+for fq in $(echo ${tfqs} | sed s/","/"\n"/g | awk '$1 !~ /_R2/ && $1 !~ /_2.fastq.gz/ && $1 !~ /_2.fq.gz/' ); do
+    if [[ "$fq1s" == "" ]]; then fq1s+=${fq}; else fq1s+=" "${fq}; fi
+done
+
+if [[ "$stval" == "PE" ]]; then
+    fq2s=""
+    for fq in $(echo ${tfqs} | sed s/","/"\n"/g | awk '$1 ~ /_R2/ || $1 ~ /_2.fastq.gz/ || $1 ~ /_2.fq.gz/'); do
+        if [[ "$fq2s" == "" ]]; then fq2s+=${fq}; else fq2s+=" "${fq}; fi
+    done
+fi
+
+echo -e "Fastq1s:  "${fq1s}", Fastq2s: "${fq2s}"\n"
+
+fqout=${rid}".L35.fq"
+
+## Run AdapterRemoval
+if [[ "$stval" == "SE" ]]; then
+    AdapterRemoval --file1 ${fq1s} --basename ${fqout} ${optstr}
+else
+    AdapterRemoval --file1 ${fq1s} --file2 ${fq2s} --basename ${fqout} ${optstr} --collapse
+    zcat ${fqout}.collapsed.gz ${fqout}.collapsed.truncated.gz ${fqout}.singleton.truncated.gz \
+    | gzip > ${fqout}.combined.gz
+fi
+
+end_1=($(date "+%s"))
+let diff=end_1-start_time
+let hour=diff/3600
+let minute=(diff-hour*3600)/60
+let second=(diff-hour*3600-minute*60)
+
+echo -e "\n\nAdapter Removal is complete, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+
+
+#######################################################################
+## Part 2. Map adapter-removed FastQ files to the reference genome   ##
+##         and remove duplicates and filter reads                    ##
+
+## DeDup was changed from 0.12.5 to 0.12.8 in the new setup
+dedup="java -Xmx8192m -jar /opt/ohpc/pub/apps/dedup/0.12.8/DeDup-0.12.8.jar"
+
+## Move into the target directory
+cd ${pt1}${iid}/BAM/
+
+echo -e "\n\n\n"
+echo "################################ 2. Read Mapping ###################################"
+echo -e "\n\n\n"
+
+## Input FastQ (after running AdapterRemoval)
+if [[ "$stval" == "SE" ]]; then
+    fqin=${pt1}${iid}"/FastQ/"${rid}"/"${fqout}".truncated.gz"
+else
+    fqin=${pt1}${iid}"/FastQ/"${rid}"/"${fqout}".combined.gz"
+fi
+
+echo -e ${fqin}" is used for mapping\n"
+
+## Repeat mapping steps for each reference species requested
+echo -e "Mapping on each reference\n"
+snum=0
+end_21=${end_1}
+for sp in $(echo ${spp} | sed s/","/" "/g); do
+    let snum+=1
+    echo -e "2."${snum}" Read Mapping on "${sp}"\n"
+
+    ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Take the reference genome .fa file
+    sid=${rid}"."${sp}
+
+    ## Make directory for each run id + reference
+    mkdir -p ${sid}
+
+    ## Setup output BAM file prefix
+    of1="./"${sid}"/"${sid}".L35.mapped"
+
+    ## Define read group
+    RG="@RG\tID:"${rid}"\tSM:"${lid}"\tLB:"${rid}"\tPL:illumina"
+
+    ## Run BWA aln (-l 9999 for non-UDG, -l 32 for UDG-half)
+    bwa aln -t 8 -n 0.01 -l ${seedval} -f ${of1}.sai ${ref} ${fqin}
+
+    ## Run BWA samse and filter out unmapped reads
+    bwa samse -r ${RG} ${ref} ${of1}.sai ${fqin} | samtools view -h -F 0x0004 -o ${of1}.0.bam -
+
+    ## Sort the output file and index
+    samtools sort -@ 2 -m 4G ${of1}.0.bam -o ${of1}.bam
+    samtools index ${of1}.bam
+
+    ## Remove temporary files
+    rm ${of1}.0.bam
+    rm ${of1}.sai
+
+    ## Remove duplicates using dedup
+    ${dedup} -i ${of1}.bam -m -o ./${sid}/
+    mv ${of1}_rmdup.bam ${of1}.rmdup.bam
+    samtools index ${of1}.rmdup.bam
+    rm ${of1}.dedup.json
+
+    mv ${of1}.hist ${of1}.rmdup.hist
+    mv ${of1}.log ${of1}.rmdup.log
+
+    ## Apply quality filter (-q30)
+    samtools view -bh -q30 -o ${of1}.rmdup.q30.bam ${of1}.rmdup.bam
+    samtools index ${of1}.rmdup.q30.bam
+
+    end_20=${end_21}
+    end_21=($(date "+%s"))
+
+    let diff=end_21-end_20
+    let hour=diff/3600
+    let minute=(diff-hour*3600)/60
+    let second=(diff-hour*3600-minute*60)
+
+    echo -e "\n\nMapping on "${sp}" is finished, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+done
+
+let diff=end_21-end_1
+let hour=diff/3600
+let minute=(diff-hour*3600)/60
+let second=(diff-hour*3600-minute*60)
+
+echo -e "\n\nMapping is totally complete, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+
+############################
+## Part 3. Run mapDamage  ##
+
+cd ${pt1}${iid}/mapDamage/
+
+echo -e "\n\n\n"
+echo "################################ 3. Check mapDamage ###################################"
+echo -e "\n\n\n"
+
+
+for sp in $(echo ${spp} | sed s/","/" "/g); do
+    ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Take the reference genome .fa file
+    sid=${rid}"."${sp}
+
+    ibam=($(realpath ${pt1}${iid}/BAM/${sid}/${sid}.L35.mapped.rmdup.q30.bam))
+
+    ## Run mapDamage
+    mapDamage -i ${ibam} -r ${ref} -d ./${sid} --merge-reference-sequences  -t ${sid} -n ${nrmax} --no-stat
+done
+
+end_3=($(date "+%s"))
+
+let diff=end_3-end_21
+let hour=diff/3600
+let minute=(diff-hour*3600)/60
+let second=(diff-hour*3600-minute*60)
+
+echo -e "\n\nmapDamage is complete, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+#############################################################
+## Part 4. Calculate whole genome coverage using qualimap  ##
+
+cd ${pt1}${iid}/qualimap/
+
+echo -e "\n\n\n"
+echo "################################ 4. Check qualimap ###################################"
+echo -e "\n\n\n"
+
+for sp in $(echo ${spp} | sed s/","/" "/g); do
+    ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Take the reference genome .fa file
+    sid=${rid}"."${sp}
+
+    ibam=($(realpath ${pt1}${iid}/BAM/${sid}/${sid}.L35.mapped.rmdup.q30.bam))
+
+    ## Run qualimap
+    qualimap bamqc -bam ${ibam} -nt 8 -outdir ./${sid} -outformat HTML --java-mem-size=15G
+done
+
+end_4=($(date "+%s"))
+
+let diff=end_4-end_3
+let hour=diff/3600
+let minute=(diff-hour*3600)/60
+let second=(diff-hour*3600-minute*60)
+
+echo -e "\n\nqualimap is complete, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+
+
+###############################
+## Part 5. genotyping        ##
+
+## We assume all snps are transversion. If you use transition SNPs, please modify it.
+
+if [ -f "$snpfl" ]; then
+
+cd ${pt1}${iid}/genotypes/
+
+    echo -e "\n\n\n"
+    echo "################################ 5. Genotyping ###################################"
+    echo -e "\n\n\n"
+
+    echo -e "Genotyping on each reference snp panel\n\n"
+    snum=0
+    end_51=${end_4}
+
+    ## Repeat the process for each SNP set of the target species
+    for sp in $(echo ${spp} | sed s/","/" "/g); do
+        let snum+=1
+        echo -e "5."${snum}" Genotyping BAM mapped on "${sp}"\n"
+
+        ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Reference
+        sid=${rid}"."${sp}
+
+        ## Make directory for each run id + reference
+        mkdir -p ${sid}
+
+        ## Define the input BAM file
+        ## no-masked file for ssLib; otherwise, end-masked BAM file
+        ibam=($(realpath ${pt1}${iid}/BAM/${sid}/${sid}.L35.mapped.rmdup.q30.bam))
+
+        awk -v sp="$sp" '{if ($1 == sp) print $2,$3}' ${snpfl} | while read -r prx sfx; do
+
+            snpf1=${prx}".snp"           ## .snp file
+            posf=${prx}".pos.list.txt"   ## .pos file
+
+            of1=${sid}"."${sfx}
+            tn1="temp1_"${of1}
+
+            ## Run samtools mpileup
+            samtools mpileup -B -R -q30 -Q30 -l ${posf} -f ${ref} ${ibam} > ./${sid}/${tn1}_1
+
+            ## Fix chromosome name by species
+            if [[ "$sp" == "Goat" ]] || [[ "$sp" == "Cattle" ]]; then
+                cut -f 1 ./${sid}/${tn1}_1 | sed s/'X'/'30'/g | sed s/'Y'/'31'/g |
+                    paste - ./${sid}/${tn1}_1 | cut -f 1,3- | sort -k1,1n -k2,2n > ./${sid}/${of1}.pileup
+            elif [[ "$sp" == "Sheep" ]]; then
+                cut -f 1 ./${sid}/${tn1}_1 | sed s/'chrX'/'27'/g | sed s/'chrY'/'28'/g | sed s/'chr'/''/g |
+                    paste - ./${sid}/${tn1}_1 | cut -f 1,3- | sort -k1,1n -k2,2n > ./${sid}/${of1}.pileup
+            fi
+
+            ## Run pileupCaller
+            ## We assume transversion SNPs, so do not think about masking or single-strand library
+            pileupCaller --randomHaploid --sampleNames ${rid} -f ${snpf1} -e ./${sid}/${tn1}_2 < ./${sid}/${of1}.pileup
+
+            ## Rename files
+            cp ./${sid}/${tn1}_2.geno ./${sid}/${of1}.geno
+
+            ## Specify sex
+            qual=${pt1}${iid}"/qualimap/"${sid}"/genome_results.txt"
+            x1=($(grep "mean coverageData" ${qual} |awk '{print $4}'| sed s/"X"/""/g ))
+            x2=($(awk '$1~/X/' ${qual} |awk '{print $4}'| sed s/"X"/""/g ))
+            echo ${rid} ${x1} ${x2} |awk '{OFS="\t"}{if ($2=="0") print $1,"U",$1; else if ($3/$2 > 0.7) print $1,"F",$1; else print $1,"M",$1}' > ./${sid}/${of1}.ind
+
+            ## Count the number and proportion of SNPs typed
+            nsnps=($(wc -l ${snpf1}))
+            echo -e 'IID\tnCovered\tpCovered' > ./${sid}/${of1}.cov.txt
+            tnum1=($(awk '$1 != 9' ./${sid}/${of1}.geno | wc -l))
+            echo ${rid} ${tnum1} ${nsnps} | awk '{printf("%s\t%d\t%.5f\n"), $1,$2,$2/$3}' >> ./${sid}/${of1}.cov.txt
+
+            ## Clear the files
+            gzip ./${sid}/${of1}.pileup
+            rm ./${sid}/${tn1}_*
+
+        done
+
+        end_50=${end_51}
+        end_51=($(date "+%s"))
+
+        let diff=end_51-end_50
+        let hour=diff/3600
+        let minute=(diff-hour*3600)/60
+        let second=(diff-hour*3600-minute*60)
+
+        echo -e "\n\nGenotyping on "${sp}" is finished, ${hour}h ${minute}m ${second}s was taken.\n\n"
+
+    done
+
+    let diff=end_51-end_4
+    let hour=diff/3600
+    let minute=(diff-hour*3600)/60
+    let second=(diff-hour*3600-minute*60)
+
+    echo -e "\n\ngenotyping is complete, ${hour}h ${minute}m ${second}s was taken.\n\n\n\n"
+
+fi
+
+#############################################################
+## Part 6. Collect per-individual summary statistic        ##
+
+cd ${pt1}${iid}/summary/
+
+hv='ID LID RID Species nr.all nr.trimmed len.trimmed nr.mapped pr.endo% nr.rmdup cluster.factor nr.rmdup.q30 pr.q30'
+hv+=' nr.mapped.on pr.endo%.on nr.rmdup.on cluster.factor.on nr.rmdup.q30.on pr.q30.on'
+hv+=' DMG51 DMG52 DMG31 DMG32 Auto chrX chrY chrMT nCov pCov'
+
+bedfdir="/home/projects1/DairyCultures/SNPCapBEDs/"
+
+echo -e "\n\n\n"
+echo "################################ 6. Summarize ###################################"
+echo -e "\n\n\n"
+
+for sp in $(echo ${spp} | sed s/","/" "/g); do
+    ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Take the reference genome .fa file
+    sid=${rid}"."${sp}
+
+    ## Make directory for each run id + reference
+    mkdir -p ${sid}
+    sumf="./"${sid}"/"${sid}".summary.txt"
+
+    echo -e ${hv} > ${sumf}
+
+    ## FastQ summary
+    logf=($(realpath ${pt1}${iid}/FastQ/${rid}/${rid}.L35.fq.settings))
+    n1=($(cat ${logf} | awk '{if ($1 ~ /^Total/) print $NF}'))
+    n2=($(cat ${logf} | awk 'BEGIN {n=0} {if ($0 ~ /^Number/ && ($0 ~ /collapsed/ || $0 ~ /singleton/)) n+=$NF} END {print n}'))
+    n3=($(cat ${logf} | awk '{if ($0 ~ /Average length of retained reads/) print $NF}'))
+
+    ## Mapping summary
+    tof1=${pt1}${iid}"/BAM/"${sid}"/"${sid}".L35.mapped"
+    n4=($(samtools view -c ${tof1}.bam))
+    n5=($(echo ${n2} ${n4}|awk '{if ($1 > 0) print 100*$2/$1; else print "NA"}')) # pr.endo
+    n6=($(samtools view -c ${tof1}.rmdup.bam))
+    n7=($(echo ${n6} ${n4}|awk '{if ($1 > 0) print $2/$1; else print "NA"}')) # cluster.factor
+    n8=($(samtools view -c ${tof1}.rmdup.q30.bam))
+    n9=($(echo ${n6} ${n8}|awk '{if ($1 > 0) print $2/$1; else print "NA"}')) # pr.q30
+
+    ## Retrieve on-target read numbers
+    ## Get the bed file
+    if [[ "$sp" == "Sheep" ]]; then
+        bedf=${bedfdir}"Ovis.974K.pos.0based.bed"; MTval="chrM"
+    elif [[ "$sp" == "Goat" ]]; then
+        bedf=${bedfdir}"Capra.974K.pos.0based.bed"; MTval="MT"
+    elif [[ "$sp" == "Cattle" ]]; then
+        bedf=${bedfdir}"Bos.974K.pos.0based.bed"; MTval="MT"
+    else
+        bedf="None"
+    fi
+
+    if [[ "$bedf" == "None" ]]; then
+        n41="NA"; n51="NA"; n61="NA"; n71="NA"; n81="NA"; n91="NA"
+    else
+        n41=($(samtools view -c -L ${bedf} ${tof1}.bam))
+        n51=($(echo ${n2} ${n41}|awk '{if ($1 > 0) print 100*$2/$1; else print "NA"}')) # pr.endo
+        n61=($(samtools view -c -L ${bedf} ${tof1}.rmdup.bam))
+        n71=($(echo ${n61} ${n41}|awk '{if ($1 > 0) print $2/$1; else print "NA"}')) # cluster.factor
+        n81=($(samtools view -c -L ${bedf} ${tof1}.rmdup.q30.bam))
+        n91=($(echo ${n61} ${n81}|awk '{if ($1 > 0) print $2/$1; else print "NA"}')) # pr.q30
+    fi
+
+    ## mapDamage summary
+    tfn1=${pt1}${iid}"/mapDamage/"${sid}"/5pCtoT_freq.txt"
+    tfn2=${pt1}${iid}"/mapDamage/"${sid}"/3pGtoA_freq.txt"
+    n10=($(head -2 ${tfn1} | tail -1 | awk '{print $2}'))
+    n11=($(head -3 ${tfn1} | tail -1 | awk '{print $2}'))
+    n12=($(head -2 ${tfn2} | tail -1 | awk '{print $2}'))
+    n13=($(head -3 ${tfn2} | tail -1 | awk '{print $2}'))
+
+    ## Coverage summary
+    qual=${pt1}${iid}"/qualimap/"${sid}"/genome_results.txt"
+    aC=($(grep "mean coverageData" ${qual} |awk '{print $4}'| sed s/"X"/""/g |awk '{printf("%.5f\n"), $1}'))
+    if [[ "$sp" == "Goat" ]] || [[ "$sp" == "Cattle" ]]; then
+        xC=($(grep -w "X" ${qual} |awk '{printf("%.5f\n"), $4}'))
+        yC=($(grep -w "Y" ${qual} |awk '{printf("%.5f\n"), $4}'))
+        mC=($(grep -w "MT" ${qual} |awk '{printf("%.2f\n"), $4}'))
+    elif [[ "$sp" == "Sheep" || "$sp" == "Horse" ]]; then
+        xC=($(grep -w "chrX" ${qual} |awk '{printf("%.5f\n"), $4}'))
+        yC="NA"
+        mC=($(grep -w "chrM" ${qual} |awk '{printf("%.5f\n"), $4}'))
+    fi
+
+    ## Genotyping summary
+    sfx=($(awk -v sp="$sp" '{if ($1 == sp) print $3}' ${snpfl}|head -n 1))
+    gfn1=${pt1}${iid}"/genotypes/"${sid}"/"${sid}"."${sfx}".cov.txt"
+
+    # If snp panel does not exists, fill with NA
+    if [ -f "$gfn1" ]; then
+        nsnp=($(tail -n +2  ${gfn1}|awk '{print $2}'))
+        psnp=($(tail -n +2  ${gfn1}|awk '{print $3}'))
+    else
+        nsnp="NA"
+        psnp="NA"
+    fi
+
+    echo ${iid} ${lid} ${rid} ${sp} ${n1} ${n2} ${n3} ${n4} ${n5} ${n6} ${n7} ${n8} ${n9} ${n41} ${n51} ${n61} ${n71} ${n81} ${n91} ${n10} ${n11} ${n12} ${n13} ${aC} ${xC} ${yC} ${mC} ${nsnp} ${psnp} >> ${sumf}
+
+done
+
+end_6=($(date "+%s"))
+echo -e "summarizing is complete."
+
+let diff=end_6-start_time
+let hour=diff/3600
+let minute=(diff-hour*3600)/60
+let second=(diff-hour*3600-minute*60)
+
+echo -e ${rid} "is totally processed, ${hour}h ${minute}m ${second}s was taken.\n\n\n\n"
+
+################################
+## 2. Merge genotypes         ##
+################################
+
+cd /home/projects1/DairyCultures/genotypes/
+
+pt1=($(pwd)"/")
+dt1="/home/projects1/DairyCultures/DataProcessing/"
+snpfl="/home/projects1/DairyCultures/genotypes/snpf_capture_list_per_species.txt"
+listf="/home/projects1/DairyCultures/DataProcessing/Animals_DairyCultures_capture_batch08_list_r1.txt"
+
+## Merge into a single file per species
+## take 974K/larger panel data for cattle/sheep/goat
+sps="Cattle Sheep Goat"
+of0s="Bos_DairyCultures_capture_batch08 Ovis_DairyCultures_capture_batch08 Capra_DairyCultures_capture_batch08"
+
+while read -r cn sp; do
+    of0=($(echo ${of0s} | awk -v cn="$cn" '{print $cn}'))
+    while read -r sp prx sfx; do
+        snp=($(echo ${sfx}|cut -d "." -f2))
+        of1=${of0}"."${snp}
+        num=0
+        ## Merge into a single file
+        genofs=""; indfs=""
+        while read -r iid lid rid; do
+            let num+=1
+            genof=($(realpath ${dt1}${iid}/genotypes/${rid}.${sp}/${rid}.${sp}.${sfx}.geno))
+            indf=($(realpath  ${dt1}${iid}/genotypes/${rid}.${sp}/${rid}.${sp}.${sfx}.ind))
+            covf=($(realpath  ${dt1}${iid}/genotypes/${rid}.${sp}/${rid}.${sp}.${sfx}.cov.txt))
+            if [ -f "$genof" ]; then
+                if [[ "$genofs" == "" ]]; then
+                    genofs+=${genof}; indfs+=${indf}
+                else
+                    genofs+=" "${genof}; indfs+=" "${indf}
+                fi
+            fi
+
+            # coverage info
+            if  [[ ( -f "$covf" ) && !( -f ${of1}.cov.txt ) ]]; then
+                if [[ "$num" -eq 1 ]]; then
+                    cat ${covf} > ${of1}.cov.txt
+                else 
+                    tail -n +2 ${covf} >>  ${of1}.cov.txt
+                fi
+            fi
+        done < <(cat ${listf}|awk -v sp="$sp" '{if ($6 ~ sp) print $1,$2,$3}')
+
+        tnind=($(echo ${genofs} | awk '{print NF}'))
+        if [ "$tnind" -gt 0 ]; then
+            if [[ !( -f ${of1}.geno ) ]]; then paste ${genofs} -d '' > ${of1}.geno ; fi 
+            if [[ !( -f ${of1}.ind ) ]]; then cat ${indfs} > ${of1}.ind ; fi 
+        fi
+
+    done < <(awk -v sp="$sp" '{if ($1 == sp) print $0}' ${snpfl})
+done < <(echo ${sps} | sed s/" "/"\n"/g | awk '{print NR,$1}')
+
+
+
+
+
+
+
+
+

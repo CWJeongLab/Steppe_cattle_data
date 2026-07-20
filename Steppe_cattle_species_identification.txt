@@ -1,0 +1,310 @@
+####################################################################
+## 1. Genotype whole transversion variants   ##
+####################################################################
+
+cd /home/projects1/DairyCultures/analysis/
+mkdir -p Bos_species_identification_260327; cd Bos_species_identification_260327
+
+pt1=($(pwd)"/")
+info="/home/projects1/DairyCultures/sample_info/Bos_ancient_sample_info_250916.txt"
+lst1=${pt1}"Giedre_sample_list_260327.txt" 
+listf=${pt1}"Bos_DairyCultures_Giedre_list_260327.txt" 
+snpfl=${pt1}"snpf_list_cattle_50M.txt" ## SNPset
+reff="/home/projects1/DataProcessing_MPI/reflist.txt"
+scf1=${pt1}"genotype_ancient_251119.sh"
+
+# Giedre's sample list 
+fgrep -wf ${lst1} ${info}| awk -F"\t" '{OFS="\t"}{print $1,$2,"ssLib",$3,$4,$5}' > ${listf}
+
+## snp list 
+echo -e "Cattle\t/data1/PubData/CattleMerged_210420/genotype/WholeGenome/Bos.PL_0.9.auto.tv.f1\tbos.50M" > ${snpfl}
+
+## Run the job as a job array
+## Transversion only panel, so we do not need to use 5-or 10-masked file (post-mortem damage-covered)
+idnmax=($(wc -l ${listf}))
+nperrun=4
+
+CMD=${scf1}" "${listf}" "${reff}" "${snpfl}
+
+sbatch --array=1-${idnmax}%${nperrun} -c 8 --mem 15000 -J pulldown -p amd --wrap="$CMD"
+
+
+rm slurm-*
+
+##################################################################################
+#### save the following script as "genotype_ancient_251119.sh" ####
+
+#!/bin/bash
+
+pt1=($(pwd)"/")
+
+listf=$1   ## A list of samples to be processed (LID, run, FastQs, type)
+reff=$2    ## the reference genome list file
+snpfl=$3   ## snp/pos file
+inum=$SLURM_ARRAY_TASK_ID
+
+iid=($(awk -v inum="$inum" '{if (inum == NR) print $1}' ${listf}))   ## Individual ID
+rid=($(awk -v inum="$inum" '{if (inum == NR) print $2}' ${listf}))   ## run ID
+type=($(awk -v inum="$inum" '{if (inum == NR) print $3}' ${listf}))   ## library type
+spp=($(awk -v inum="$inum" '{if (inum == NR) print $4}' ${listf}))  ## comma separated species list
+dt1=($(awk -v inum="$inum" '{if (inum == NR) print $5}' ${listf}))  ## directory
+
+
+## Create directories
+mkdir -p ${dt1}${iid}/genotypes/ 
+
+
+###############################
+## Part 2. genotyping        ##
+
+if [ -f "$snpfl" ]; then
+
+cd ${dt1}${iid}/genotypes/
+
+    echo -e "\n\n\n"
+    echo "################################ 2. Genotyping ###################################"
+    echo -e "\n\n\n"
+
+    echo -e "Genotyping on each reference snp panel\n\n"
+    snum=0
+    end_51=${end_4}
+
+    ## Repeat the process for each SNP set of the target species
+    for sp in $(echo ${spp} | sed s/","/" "/g); do
+        let snum+=1
+        echo -e "5."${snum}" Genotyping BAM mapped on "${sp}"\n"
+
+        ref=($(awk -v sp="$sp" '{if ($1 == sp) print $2}' ${reff}))  ## Reference
+        sid=${rid}"."${sp}
+
+        ## Make directory for each run id + reference
+        mkdir -p ${sid}; cd ${sid}
+
+        ibam1=${dt1}${iid}"/BAM/"${sid}"/"${sid}".L35.mapped.rmdup.q30.bam"
+
+        awk -v sp="$sp" '{if ($1 == sp) print $2,$3}' ${snpfl} | while read -r prx sfx; do
+
+            snpf1=${prx}".snp"           ## .snp file
+            posf=${prx}".pos.list.txt"   ## .pos file
+
+            of1=${sid}"."${sfx}
+            tn1="temp1_"${of1}
+
+            if [[ "$type" != "ssLib" ]]; then
+                ## Run pileupCaller for raw bam file
+                samtools mpileup -B -R -q30 -Q30 -l ${posf} -f ${ref} ${ibam1} > ${tn1}_1
+                cut -f1 ${tn1}_1 | sed s/'X'/'30'/g | sed s/'Y'/'31'/g | paste - ${tn1}_1 | cut -f1,3- > ${of1}.pileup ## Fix chromosome name by species
+                rm ${tn1}_1
+                pileupCaller --randomHaploid --sampleNames ${rid} -f ${snpf1} -e ${tn1}_1 < ${of1}.pileup
+
+                ## Run pileupCaller for trimmed bam file
+                ibam2=${dt1}${iid}"/BAM/"${sid}"/"${sid}".L35.mapped.rmdup.q30.m"${mask}".bam"
+                samtools mpileup -B -R -q30 -Q30 -l ${posf} -f ${ref} ${ibam2} > ${tn1}_2
+                cut -f1 ${tn1}_2 | sed s/'X'/'30'/g | sed s/'Y'/'31'/g | paste - ${tn1}_2 | cut -f1,3- > ${of1}.masked.pileup 
+                ## Fix chromosome name by species
+                rm ${tn1}_2
+                pileupCaller --randomHaploid --sampleNames ${rid} -f ${snpf1} -e ${tn1}_2 < ${of1}.masked.pileup
+
+                ## Choose calls from masked data for C/T and G/A SNPs
+                paste ${snpf1} ${tn1}_1.geno ${tn1}_2.geno | \
+                awk '{if ($5$6 == "CT" || $5$6 == "TC" || $5$6 == "GA" || $5$6 == "AG") print $8; else print $7}' > ${of1}.geno        
+            else
+                ## Run pileupCaller for ibam1 only but with SingleStrandMode option
+                samtools mpileup -B -R -q30 -Q30 -l ${posf} -f ${ref} ${ibam1} > ${tn1}_1
+                cut -f1 ${tn1}_1 | sed s/'X'/'30'/g | sed s/'Y'/'31'/g | paste - ${tn1}_1 | cut -f1,3- > ${of1}.pileup ## Fix chromosome name by species
+                rm ${tn1}_1
+                pileupCaller --randomHaploid --singleStrandMode --sampleNames ${rid} -f ${snpf1} -e ${tn1}_1 < ${of1}.pileup
+                mv ${tn1}_1.geno ${of1}.geno
+            fi
+
+            ## Specify sex
+            qual=${dt1}${iid}"/qualimap/"${sid}"/genome_results.txt"
+            x1=($(grep "mean coverageData" ${qual} |awk '{print $4}'| sed s/"X"/""/g ))
+            x2=($(awk '$1~/X/' ${qual} |awk '{print $4}'| sed s/"X"/""/g ))
+            echo ${rid} ${x1} ${x2} |awk '{OFS="\t"}{if ($2=="0") print $1,"U",$1; else if ($3/$2 > 0.7) print $1,"F",$1; else print $1,"M",$1}' > ${of1}.ind
+
+            ## Count the number and proportion of SNPs typed
+            nsnps=($(wc -l ${snpf1}))
+            echo -e 'IID\tnCovered\tpCovered' > ${of1}.cov.txt
+            tnum1=($(awk '$1 != 9' ${of1}.geno | wc -l))
+            echo ${rid} ${tnum1} ${nsnps} | awk '{printf("%s\t%d\t%.5f\n"), $1,$2,$2/$3}' >> ${of1}.cov.txt
+
+            ## Clear the files
+            gzip ${of1}.pileup
+            gzip ${of1}.masked.pileup
+            rm ${tn1}_*
+
+        done
+        
+        cd ..
+
+    done
+
+fi
+
+
+#########################################################
+#### 2. Calculate PMR with species panel for species identification #####
+#########################################################
+
+cd /home/projects1/DairyCultures/analysis/Bos_species_identification_260327
+mkdir -p PMR 
+
+pt1=($(pwd)"/")
+lst1=${pt1}"Bos_DairyCultures_Giedre_list_260327.txt"
+snpfl=${pt1}"snpf_list_cattle_50M.txt" ## SNPset
+fn1="/data2/projects1/AnimalsChina/analysis/Bos/Classification_240526/panel/Cattle_panel" ## species genotype panel 
+scf1=${pt1}"Calculate_PMR_matrix_per_genome.sh"
+scf2=${pt1}"Calculate_PMR_matrix_per_genome.R"
+
+# Calculate PMR per genome 
+CMD=${scf1}" "${lst1}" "${snpfl}" "${fn1}" "${scf2}
+
+idnmax=($(wc -l ${lst1}))
+nperrun=40
+
+sbatch --array=1-${idnmax}%${nperrun} -c 8 --mem 22000 -p amd --wrap="$CMD"
+
+# Combine results 
+of1=${pt1}"Dairyculture_50M_PMR_for_classification_260625.txt"
+
+echo -e "IID\tRID\tnSNP\tClosest\tAST\tASA\tSAI\tDOY\tWAB\tGOA" > ${of1}
+
+sfx="bos.50M"
+while read iid rid type sp dt1 prj; do 
+    tn1=${pt1}"PMR/"${rid}".bos.50M.pmr.txt"
+    cov1=${dt1}${iid}"/genotypes/"${rid}"."${sp}"/"${rid}"."${sp}"."${sfx}".cov.txt"
+    c1=($(tail -n +2 ${cov1}|cut -f2))
+    clo=($(tail -n +2 ${tn1}| awk '$4!="aAST"' |sort -k7,7n| cut -f4))
+    n1=($(awk '{ if ($4=="AST") print $7}' ${tn1}))
+    n2=($(awk '{ if ($4=="ASA") print $7}' ${tn1}))
+    n3=($(awk '{ if ($4=="SAI") print $7}' ${tn1}))
+    n4=($(awk '{ if ($4=="DOY") print $7}' ${tn1}))
+    n5=($(awk '{ if ($4=="WAB") print $7}' ${tn1}))
+    n6=($(awk '{ if ($4=="GOA") print $7}' ${tn1}))
+    echo ${iid} ${rid} ${c1} ${clo} ${n1} ${n2} ${n3} ${n4} ${n5} ${n6}|sed s/" "/"\t"/g >> ${of1}
+done < ${lst1}
+
+
+
+
+#####################################################################################
+################ save the following script as "Calculate_PMR_matrix.sh" ############
+
+#!/bin/bash 
+
+lst1=$1
+snpfl=$2
+fn1=$3
+scf2=$4
+
+pt1=($(pwd)"/")
+
+inum=$SLURM_ARRAY_TASK_ID
+
+iid=($(awk -v inum=$inum '{if (NR==inum) print $1}' ${lst1}))
+rid=($(awk -v inum=$inum '{if (NR==inum) print $2}' ${lst1}))
+sp=($(awk -v inum=$inum '{if (NR==inum) print $4}' ${lst1}))
+dt1=($(awk -v inum=$inum '{if (NR==inum) print $5}' ${lst1}))
+
+while read prx sfx; do 
+    of1=${pt1}"PMR/"${rid}"."${sfx}".pmr.txt"
+    fn2=${dt1}${iid}"/genotypes/"${rid}"."${sp}"/"${rid}"."${sp}"."${sfx}
+    ${scf2} ${fn1} ${fn2} ${of1}
+done < <(awk -v sp=$sp '{if ($1==sp) print $2,$3}' ${snpfl})
+
+
+#####################################################################################
+################ save the following script as "Calculate_PMR_matrix.R" ############
+
+#!/home/donghee_kim/.conda/envs/Admixtools/bin/Rscript
+
+library(data.table)
+library(tictoc)
+
+args = commandArgs(trailingOnly=TRUE)
+
+rm=list()
+fn1=args[1]
+fn2=args[2]
+of1=args[3]
+
+## Measure time for matrix multiplication 
+tic("Total PMR calculation")
+tic("Reading genotypes")
+
+# input 
+pgeno <- as.matrix(fread(paste0(fn1,".geno.txt"),sep=" ",header=F,data.table=FALSE))
+pind <- fread(paste0(fn1,".ind"),sep="\t",header=F)
+colnames(pind) <- c("iid","sex","pid")
+
+geno <- as.matrix(fread(paste0(fn2,".geno"),sep=" ",header=F,data.table=FALSE))
+ind <- fread(paste0(fn2,".ind"),sep="\t",header=F)
+colnames(ind) <- c("iid","sex","pid")
+
+toc() # end of reading genotypes
+
+# memory size of matrix 
+print(paste0("The size of genotype matrix : ",as.integer(object.size(geno)/1e6)," Mb") )
+
+# convert genotype matrix 
+tic("Matrix multiplication")
+# first, calculate nmismatch (shifted later)
+geno_c <- geno - 1 
+geno_c[geno_c %% 8 == 0] <- 0 # 9-1 as missing 
+pgeno_c <- pgeno - 1 
+pgeno_c[pgeno_c %% 8 == 0] <- 0 # 9-1 as missing 
+
+count_matrix <- t(geno_c) %*% pgeno_c
+
+# second, calculate nsnps by each individual pairs 
+geno[geno == 0|geno == 2] <- 1
+geno[geno == 9] <- 0
+pgeno[pgeno == 0|pgeno == 2] <- 1
+pgeno[pgeno == 9] <- 0
+
+nsnp_matrix <- t(geno) %*% pgeno
+
+# Third, combine it to calculate pmr 
+nmis_matrix <- -(1/2)*(count_matrix) + (1/2)*(nsnp_matrix)
+pmr_matrix <- nmis_matrix/nsnp_matrix
+
+toc() # end of matrix multiplication
+
+# maximum memory used 
+print(paste0("Maximum memory used : ",as.integer(gc()[2,6])," Mb") )
+
+# convert to data table 
+tic("Coverting into data table")
+iid1_vec <- c(); iid2_vec <- c(); pid1_vec <- c(); pid2_vec <- c()
+nsnp_vec <- c(); nmis_vec <- c(); pmis_vec <- c()
+
+for (i in 1:nrow(ind))  { 
+    for (j in 1:nrow(pind))  { 
+        # unique indivs pairs
+        iid1 <- as.character(ind$iid[i]) ; pid1 <- as.character(ind$pid[i])
+        iid2 <- as.character(pind$iid[j]) ; pid2 <- as.character(pind$pid[j])
+
+        # add to vector 
+        iid1_vec <- c(iid1_vec,iid1); iid2_vec <- c(iid2_vec,iid2); pid1_vec <- c(pid1_vec,pid1); pid2_vec <- c(pid2_vec,pid2)
+        nsnp_vec <- c(nsnp_vec,nsnp_matrix[i,j]); nmis_vec <- c(nmis_vec,nmis_matrix[i,j]); pmis_vec <- c(pmis_vec,pmr_matrix[i,j])
+    }
+}
+
+toc() # end of converting
+
+# write output file 
+tic("Writing")
+
+df <- data.frame(cbind(iid1_vec,pid1_vec,iid2_vec,pid2_vec,nsnp_vec,nmis_vec,pmis_vec))
+colnames(df) <- c("IID1","PID1","IID2","PID2","nsnp","nmismatch","pmismatch")
+
+df[df$pmismatch==NaN,6] <- NA 
+df[df$pmismatch==NaN,7] <- NA 
+
+write.table(df, file=of1, quote=F, sep="\t", row.names=F)
+
+toc() # end of writing 
+
+toc() # end of commands
+
